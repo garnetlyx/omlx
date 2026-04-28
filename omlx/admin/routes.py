@@ -53,6 +53,13 @@ logger = logging.getLogger(__name__)
 PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
 
 
+def _request_source(request: Request) -> str:
+    client = request.client.host if request.client else "unknown"
+    ua = request.headers.get("user-agent", "-")
+    referer = request.headers.get("referer", "-")
+    return f"path={request.url.path} client={client} ua={ua!r} referer={referer!r}"
+
+
 # =============================================================================
 # Pydantic Models
 # =============================================================================
@@ -700,7 +707,11 @@ def _apply_log_level_runtime(level: str) -> None:
     logging.getLogger("uvicorn.access").setLevel(log_level)
 
 
-async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
+async def _apply_model_dirs_runtime(
+    model_dirs: list[str],
+    *,
+    source: str | None = None,
+) -> tuple[bool, str]:
     """
     Apply model directories change at runtime by re-scanning models.
 
@@ -755,7 +766,11 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     loaded_models = pool.get_loaded_model_ids()
     for model_id in loaded_models:
         try:
-            await pool._unload_engine(model_id)
+            await pool._unload_engine(
+                model_id,
+                reason="model_dirs_reload",
+                source=source,
+            )
         except Exception as e:
             logger.warning(f"Error unloading {model_id}: {e}")
 
@@ -792,7 +807,7 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     )
 
 
-async def _reload_models() -> tuple[bool, str]:
+async def _reload_models(*, source: str | None = None) -> tuple[bool, str]:
     """
     Reload models: re-read model_settings.json, re-scan dirs, re-apply overrides,
     and preload pinned models.
@@ -821,7 +836,7 @@ async def _reload_models() -> tuple[bool, str]:
     model_dirs = [str(d) for d in global_settings.get_effective_model_dirs()]
 
     # Unload all, re-discover, re-apply overrides
-    success, msg = await _apply_model_dirs_runtime(model_dirs)
+    success, msg = await _apply_model_dirs_runtime(model_dirs, source=source)
     if not success:
         return False, msg
 
@@ -963,7 +978,11 @@ async def _apply_cache_settings_runtime(
     loaded_models = pool.get_loaded_model_ids()
     for model_id in loaded_models:
         try:
-            await pool._unload_engine(model_id)
+            await pool._unload_engine(
+                model_id,
+                reason="cache_settings_change",
+                source="admin cache settings",
+            )
         except Exception as e:
             logger.warning(f"Error unloading {model_id}: {e}")
 
@@ -1975,6 +1994,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 @router.post("/api/models/{model_id}/unload")
 async def unload_model(
     model_id: str,
+    request: Request,
     is_admin: bool = Depends(require_admin),
 ):
     """Manually unload a model from memory."""
@@ -1988,7 +2008,11 @@ async def unload_model(
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await engine_pool._unload_engine(model_id)
+    await engine_pool._unload_engine(
+        model_id,
+        reason="manual_admin_unload",
+        source=_request_source(request),
+    )
     logger.info(f"Manually unloaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
@@ -2058,9 +2082,14 @@ async def load_model(
 
 
 @router.post("/api/reload")
-async def reload_models(is_admin: bool = Depends(require_admin)):
+async def reload_models(
+    request: Request,
+    is_admin: bool = Depends(require_admin),
+):
     """Reload models: re-read model settings, re-discover models, preload pinned."""
-    success, message = await _reload_models()
+    source = _request_source(request)
+    logger.info(f"Reload models requested ({source})")
+    success, message = await _reload_models(source=source)
     if success:
         return {"status": "ok", "message": message}
     raise HTTPException(status_code=500, detail=message)
@@ -3293,6 +3322,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
 @router.post("/api/global-settings")
 async def update_global_settings(
     request: GlobalSettingsRequest,
+    http_request: Request,
     is_admin: bool = Depends(require_admin),
 ):
     """
@@ -3434,7 +3464,10 @@ async def update_global_settings(
             effective_dirs = [
                 str(d) for d in global_settings.get_effective_model_dirs(new_dirs)
             ]
-            success, msg = await _apply_model_dirs_runtime(effective_dirs)
+            success, msg = await _apply_model_dirs_runtime(
+                effective_dirs,
+                source=_request_source(http_request),
+            )
             if success:
                 global_settings.model.model_dirs = new_dirs
                 global_settings.model.model_dir = new_dirs[0] if new_dirs else None
@@ -5219,6 +5252,7 @@ async def probe_cache(
 @router.post("/api/hf/download")
 async def start_hf_download(
     request: HFDownloadRequest,
+    http_request: Request,
     is_admin: bool = Depends(require_admin),
 ):
     """Start downloading a model from HuggingFace."""
@@ -5226,6 +5260,10 @@ async def start_hf_download(
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
     try:
+        logger.info(
+            f"HF download requested: repo_id={request.repo_id} "
+            f"({_request_source(http_request)})"
+        )
         task = await _hf_downloader.start_download(request.repo_id, request.hf_token)
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
@@ -5532,7 +5570,11 @@ async def delete_hf_model(
         loaded_ids = engine_pool.get_loaded_model_ids()
         if model_name in loaded_ids:
             try:
-                await engine_pool._unload_engine(model_name)
+                await engine_pool._unload_engine(
+                    model_name,
+                    reason="delete_model",
+                    source=f"path={model_path}",
+                )
                 logger.info(f"Unloaded model '{model_name}' before deletion")
             except Exception as e:
                 logger.warning(f"Failed to unload model '{model_name}': {e}")
@@ -5610,6 +5652,7 @@ async def ms_status(is_admin: bool = Depends(require_admin)):
 @router.post("/api/ms/download")
 async def start_ms_download(
     request: MSDownloadRequest,
+    http_request: Request,
     is_admin: bool = Depends(require_admin),
 ):
     """Start downloading a model from ModelScope."""
@@ -5619,6 +5662,10 @@ async def start_ms_download(
         )
 
     try:
+        logger.info(
+            f"MS download requested: model_id={request.model_id} "
+            f"({_request_source(http_request)})"
+        )
         task = await _ms_downloader.start_download(request.model_id, request.ms_token)
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
