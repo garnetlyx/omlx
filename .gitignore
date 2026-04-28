@@ -113,3 +113,7 @@ omlx/admin/tailwindcss-*
 
 # Git worktrees
 .worktrees/
+
+# Local session logs
+docs/SESSION_LOG.md
+SESSION_LOG.md

@@ -256,7 +256,11 @@ class ProcessMemoryEnforcer:
                             f"Evicting model '{victim}' to enforce "
                             f"process memory limit"
                         )
-                        await self._engine_pool._unload_engine(victim)
+                        await self._engine_pool._unload_engine(
+                            victim,
+                            reason="process_memory_enforcer",
+                            source=f"active={_format_gb(mx.get_active_memory())} limit={_format_gb(self._max_bytes)}",
+                        )
                         continue
                     else:
                         # Single model: abort all requests, keep model

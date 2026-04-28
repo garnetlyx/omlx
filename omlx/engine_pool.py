@@ -335,7 +335,11 @@ class EnginePool:
                         f"Unloading VLM engine for {model_id} "
                         f"(force_lm=True, reloading as LM)"
                     )
-                    await self._unload_engine(model_id)
+                    await self._unload_engine(
+                        model_id,
+                        reason="force_lm_reload",
+                        source="get_engine(force_lm=True)",
+                    )
                 else:
                     entry.last_access = time.time()
                     return entry.engine
@@ -395,7 +399,11 @@ class EnginePool:
                                 f"({format_size(projected)} > "
                                 f"{format_size(enforcer.max_bytes)})"
                             )
-                            await self._unload_engine(victim)
+                            await self._unload_engine(
+                                victim,
+                                reason="process_memory_eviction",
+                                source=f"target_model={model_id}",
+                            )
                             continue
                         # No more victims — cannot fit
                         raise InsufficientMemoryError(
@@ -440,7 +448,11 @@ class EnginePool:
                         f"all loaded models are pinned."
                     ),
                 )
-            await self._unload_engine(victim)
+            await self._unload_engine(
+                victim,
+                reason="max_model_memory_eviction",
+                source=f"required={format_size(required)}",
+            )
 
     def _find_lru_victim(self) -> str | None:
         """
@@ -470,7 +482,13 @@ class EnginePool:
         candidates.sort()  # Sort by last_access (oldest first)
         return candidates[0][1]
 
-    async def _unload_engine(self, model_id: str) -> None:
+    async def _unload_engine(
+        self,
+        model_id: str,
+        *,
+        reason: str = "unspecified",
+        source: str | None = None,
+    ) -> None:
         """
         Immediately stop and unload an engine with memory settle barrier.
 
@@ -479,13 +497,19 @@ class EnginePool:
         tracking counter.
 
         Args:
-            model_id: The model ID to unload
+            model_id: The model ID to unload.
+            reason: Machine-readable reason for logs.
+            source: Optional request or caller context for logs.
         """
         entry = self._entries.get(model_id)
         if not entry or entry.engine is None:
             return
 
-        logger.info(f"Unloading model: {model_id} (immediate abort)")
+        source_suffix = f", source={source}" if source else ""
+        logger.info(
+            f"Unloading model: {model_id} "
+            f"(immediate abort, reason={reason}{source_suffix})"
+        )
         pre_unload_active = mx.get_active_memory()
 
         try:
@@ -546,7 +570,8 @@ class EnginePool:
                 f"Unloaded model: {model_id}, "
                 f"freed={format_size(actual_freed)} "
                 f"(expected>={format_size(min_expected_freed)}), "
-                f"active_memory: {format_size(active_now)} (settled)"
+                f"active_memory: {format_size(active_now)} (settled), "
+                f"reason={reason}{source_suffix}"
             )
         else:
             # Barrier timed out - try emergency reclaim
@@ -573,7 +598,8 @@ class EnginePool:
             else:
                 logger.info(
                     f"Emergency reclaim succeeded: "
-                    f"active_memory={format_size(active_after)}"
+                    f"active_memory={format_size(active_after)}, "
+                    f"reason={reason}{source_suffix}"
                 )
 
     async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
@@ -944,7 +970,11 @@ class EnginePool:
                 entry = self._entries.get(model_id)
                 if entry and entry.engine is not None:
                     try:
-                        await self._unload_engine(model_id)
+                        await self._unload_engine(
+                            model_id,
+                            reason="shutdown",
+                            source="engine_pool.shutdown",
+                        )
                     except Exception as e:
                         logger.error(f"Error unloading {model_id} during shutdown: {e}")
 
@@ -1035,7 +1065,11 @@ class EnginePool:
                     f"TTL expired for model '{model_id}' "
                     f"(idle {idle_time:.0f}s > ttl {effective_ttl}s)"
                 )
-                await self._unload_engine(model_id)
+                await self._unload_engine(
+                    model_id,
+                    reason="ttl_expired",
+                    source=f"idle={idle_time:.0f}s ttl={effective_ttl}s",
+                )
                 expired.append(model_id)
 
         return expired
