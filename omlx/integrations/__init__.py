@@ -3,8 +3,10 @@
 from omlx.integrations.base import Integration
 from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
-from omlx.integrations.opencode import OpenCodeIntegration
+from omlx.integrations.copilot import CopilotIntegration
+from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
+from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration
 
 INTEGRATIONS: dict[str, Integration] = {
@@ -12,7 +14,9 @@ INTEGRATIONS: dict[str, Integration] = {
     "codex": CodexIntegration(),
     "opencode": OpenCodeIntegration(),
     "openclaw": OpenClawIntegration(),
+    "hermes": HermesIntegration(),
     "pi": PiIntegration(),
+    "copilot": CopilotIntegration(),
 }
 
 
@@ -29,6 +33,8 @@ def list_integrations() -> list[Integration]:
 __all__ = [
     "Integration",
     "ClaudeCodeIntegration",
+    "CopilotIntegration",
+    "HermesIntegration",
     "INTEGRATIONS",
     "get_integration",
     "list_integrations",

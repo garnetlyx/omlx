@@ -161,6 +161,116 @@ class TestQwen35Model:
         assert hasattr(Model, "_omlx_mtp_patched")
 
 
+class TestQwen35MoeSanitize:
+    """Regression tests for the MoE MTP sanitize patch (qwen3_5_moe.Model)."""
+
+    @pytest.fixture(autouse=True)
+    def _apply(self):
+        try:
+            from omlx.patches.mlx_lm_mtp import qwen35_model
+        except ImportError:
+            pytest.skip("omlx.patches.mlx_lm_mtp not importable")
+        if not qwen35_model.apply():
+            pytest.skip("qwen35_model patch refused to apply")
+        from omlx.patches.mlx_lm_mtp.qwen35_model import _patch_qwen3_5_moe
+        _patch_qwen3_5_moe()
+
+    @pytest.fixture()
+    def moe_model(self):
+        from types import SimpleNamespace
+        from mlx_lm.models import qwen3_5_moe as moe
+
+        args = SimpleNamespace(
+            num_hidden_layers=2,
+            mtp_num_hidden_layers=1,
+            num_experts=4,
+        )
+        inner = SimpleNamespace(args=args, sanitize=lambda w: w)
+        model = moe.Model.__new__(moe.Model)
+        model.language_model = inner
+        return model
+
+    def _backbone_weights(self):
+        import mlx.core as mx
+
+        weights = {}
+        for layer in range(2):
+            pfx = f"language_model.model.layers.{layer}.mlp"
+            weights[f"{pfx}.experts.gate_up_proj"] = mx.zeros((4, 128, 64))
+            weights[f"{pfx}.experts.down_proj"] = mx.zeros((4, 64, 128))
+        weights["language_model.model.embed_tokens.weight"] = mx.zeros((256, 64))
+        return weights
+
+    def test_sanitize_no_mtp_weights(self, moe_model, caplog):
+        """Config declares mtp_num_hidden_layers=1 but no MTP weights exist
+        (model quantized without preserve_mtp). Must not crash."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG):
+            result = moe_model.sanitize(self._backbone_weights())
+        assert not any("mtp" in k for k in result)
+        assert any("no MTP weights found" in r.getMessage() for r in caplog.records)
+
+    def test_sanitize_switch_mlp_form(self, moe_model):
+        """oQ outputs store MTP experts in switch_mlp form — sanitize skips."""
+        import mlx.core as mx
+
+        weights = self._backbone_weights()
+        pfx = "language_model.mtp.layers.0.mlp"
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            weights[f"{pfx}.switch_mlp.{proj}.weight"] = mx.zeros((4, 64, 128))
+        result = moe_model.sanitize(weights)
+        assert f"{pfx}.switch_mlp.gate_proj.weight" in result
+
+    def test_sanitize_per_expert_form(self, moe_model):
+        """Raw HF Qwen3.5 per-expert tensors stacked into switch_mlp."""
+        import mlx.core as mx
+
+        weights = self._backbone_weights()
+        pfx = "language_model.mtp.layers.0.mlp"
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                weights[f"{pfx}.experts.{e}.{proj}.weight"] = mx.zeros((64, 128))
+        result = moe_model.sanitize(weights)
+        assert f"{pfx}.switch_mlp.gate_proj.weight" in result
+
+    def test_sanitize_fused_form(self, moe_model):
+        """Qwen3.6 fused gate_up_proj unfused into switch_mlp."""
+        import mlx.core as mx
+
+        weights = self._backbone_weights()
+        pfx = "language_model.mtp.layers.0.mlp"
+        weights[f"{pfx}.experts.gate_up_proj"] = mx.zeros((4, 128, 64))
+        weights[f"{pfx}.experts.down_proj"] = mx.zeros((4, 64, 128))
+        result = moe_model.sanitize(weights)
+        assert f"{pfx}.switch_mlp.gate_proj.weight" in result
+
+    def test_sanitize_dense_mtplx_form(self, moe_model):
+        """MTPLX-format checkpoints ship a dense MLP at the MTP layer
+        (no ``experts.*`` keys). Sanitize must short-circuit, not attempt
+        to stack non-existent per-expert tensors.
+
+        Regression guard for samuelfaj/Ornstein3.6-35B-A3B-SABER-6bit-MTPLX.
+        """
+        import mlx.core as mx
+
+        weights = self._backbone_weights()
+        pfx = "language_model.mtp.layers.0.mlp"
+        weights[f"{pfx}.gate_proj.weight"] = mx.zeros((64, 128))
+        weights[f"{pfx}.up_proj.weight"] = mx.zeros((64, 128))
+        weights[f"{pfx}.down_proj.weight"] = mx.zeros((128, 64))
+        weights[f"{pfx}.gate.weight"] = mx.zeros((4, 64))
+        weights[f"{pfx}.shared_expert.gate_proj.weight"] = mx.zeros((64, 128))
+
+        result = moe_model.sanitize(weights)
+
+        # Dense MTP keys survive untouched.
+        assert f"{pfx}.gate_proj.weight" in result
+        assert f"{pfx}.shared_expert.gate_proj.weight" in result
+        # No bogus switch_mlp keys synthesized for the dense layer.
+        assert f"{pfx}.switch_mlp.gate_proj.weight" not in result
+
+
 class TestDeepseekV4Model:
     def test_skip_when_base_patch_not_applied(self, monkeypatch):
         """deepseek_v4 MTP patch must skip cleanly if the base
@@ -221,6 +331,7 @@ class TestBatchGeneratorDispatch:
         assert hasattr(GenerationBatch, "_omlx_mtp_patched")
 
     def test_is_mtp_eligible_requires_mtp_forward_and_solo_batch(self):
+        from omlx.patches import mlx_lm_mtp
         from omlx.patches.mlx_lm_mtp.batch_generator import _is_mtp_eligible
 
         class _NonMtpModel:
@@ -228,14 +339,14 @@ class TestBatchGeneratorDispatch:
 
         class _MtpModelWithoutHead:
             """Has the patched method but no actual MTP head attached
-            (mtp_enabled was False when this hypothetical model loaded)."""
+            (config did not declare an MTP head when this model loaded)."""
 
             def mtp_forward(self, *_):
                 pass
 
         class _MtpModel:
-            """Has both the method and the attached head — i.e. mtp_enabled
-            was True at load time."""
+            """Has both the method and the attached head — i.e. the model
+            class was patched and the head was attached at load time."""
 
             def __init__(self):
                 self.mtp = object()  # placeholder for an actual MTPModule
@@ -248,18 +359,34 @@ class TestBatchGeneratorDispatch:
                 self.model = model
                 self.uids = uids
 
-        # Non-MTP model never triggers the MTP path.
-        assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
-        # Has mtp_forward but no attached head → still off (mtp_enabled was False).
-        assert (
-            _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1])) is False
-        )
-        # Has both method and head + batch=1 → triggers the path.
-        assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
-        # MTP model with batch=2 falls back to standard step.
-        assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
-        # Empty batch never triggers.
-        assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
+        prior_active = mlx_lm_mtp.is_mtp_active()
+        try:
+            # Head attached but the per-load mtp_active flag is off
+            # (e.g. VLM runtime patches attach unconditionally so weight
+            # load matches, while inference-time MTP stays disabled).
+            mlx_lm_mtp.set_mtp_active(False)
+            assert (
+                _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
+            )
+
+            mlx_lm_mtp.set_mtp_active(True)
+            # Non-MTP model never triggers the MTP path.
+            assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
+            # Has mtp_forward but no attached head → still off.
+            assert (
+                _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1]))
+                is False
+            )
+            # Has both method and head + batch=1 + flag on → triggers the path.
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
+            # MTP model with batch=2 falls back to standard step.
+            assert (
+                _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
+            )
+            # Empty batch never triggers.
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
+        finally:
+            mlx_lm_mtp.set_mtp_active(prior_active)
 
 
 # ---------------------------------------------------------------------------

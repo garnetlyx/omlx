@@ -117,3 +117,6 @@ omlx/admin/tailwindcss-*
 # Local session logs
 docs/SESSION_LOG.md
 SESSION_LOG.md
+
+# UV lockfile
+uv.lock

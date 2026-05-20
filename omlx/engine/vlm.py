@@ -365,6 +365,11 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
 
     def _patched(path, **kwargs):
         cfg = original(path, **kwargs)
+
+        from ..utils.model_loading import expand_per_layer_quant_keys
+
+        expand_per_layer_quant_keys(cfg)
+
         if cfg.get("audio_config") is None:
             return cfg
         try:
@@ -397,6 +402,62 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         yield
     finally:
         _vu.load_config = original
+
+
+_NESTED_VIS_PREFIX = "language_model.model.visual."
+_VISION_TOWER_PREFIX = "vision_tower."
+
+
+@contextlib.contextmanager
+def _remap_nested_visual_on_load(model_dir: Path):
+    """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
+    ``load_model`` for MLX-format models where sanitize is skipped.
+
+    mlx-vlm's ``load_model`` skips ``Model.sanitize`` when the safetensors
+    metadata declares ``format=mlx``. oQ output is MLX-format, so the
+    nested-visual key fixup that sanitize normally applies never fires.
+    This context manager wraps ``load_model`` to intercept the weight dict
+    and perform the remap before ``nn.Module.load_weights`` is called.
+
+    Scoped to a single ``vlm_load(...)`` call.
+    """
+    import mlx_vlm.utils as _vu
+
+    original_load_model = _vu.load_model
+
+    def _patched_load_model(model_path, lazy=False, **kwargs):
+        import mlx.nn as _nn
+
+        orig_load_weights = _nn.Module.load_weights
+        def _remapping_load_weights(self, weights_items, *args, **kw):
+            if isinstance(weights_items, str):
+                return orig_load_weights(self, weights_items, *args, **kw)
+            remapped = []
+            n = 0
+            for k, v in weights_items:
+                if k.startswith(_NESTED_VIS_PREFIX):
+                    k = _VISION_TOWER_PREFIX + k[len(_NESTED_VIS_PREFIX):]
+                    n += 1
+                remapped.append((k, v))
+            if n:
+                logger.info(
+                    "remap_nested_visual_on_load: remapped %d keys "
+                    "'language_model.model.visual.*' -> 'vision_tower.*'",
+                    n,
+                )
+            return orig_load_weights(self, remapped, *args, **kw)
+
+        _nn.Module.load_weights = _remapping_load_weights
+        try:
+            return original_load_model(model_path, lazy, **kwargs)
+        finally:
+            _nn.Module.load_weights = orig_load_weights
+
+    _vu.load_model = _patched_load_model
+    try:
+        yield
+    finally:
+        _vu.load_model = original_load_model
 
 
 # Models that only support a single image per request
@@ -585,6 +646,18 @@ class VLMBatchedEngine(BaseEngine):
 
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
+        from ..utils.model_loading import maybe_load_custom_quantization
+
+        # Apply pre-load patches (MTP runtime patch, etc.) before the model
+        # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
+        # is a no-op when the model is incompatible.
+        try:
+            from ..utils.model_loading import maybe_apply_pre_load_patches
+            maybe_apply_pre_load_patches(
+                self._model_name, model_settings=self._model_settings
+            )
+        except Exception as e:
+            logger.debug(f"pre-load patches skipped: {e}")
 
         # Load VLM model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
@@ -593,7 +666,16 @@ class VLMBatchedEngine(BaseEngine):
         def _load_vlm_sync():
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
-            with _strip_audio_config_if_orphaned(Path(self._model_name)):
+            with _strip_audio_config_if_orphaned(Path(self._model_name)), \
+                 _remap_nested_visual_on_load(Path(self._model_name)):
+                custom_loaded = maybe_load_custom_quantization(
+                    self._model_name,
+                    is_vlm=True,
+                )
+                if custom_loaded is not None:
+                    model, processor = custom_loaded
+                    return model, processor
+
                 return vlm_load(
                     self._model_name, trust_remote_code=self._trust_remote_code
                 )
@@ -687,9 +769,31 @@ class VLMBatchedEngine(BaseEngine):
                 try:
                     from mlx_lm import load as mlx_lm_load
 
+                    from ..utils.model_loading import maybe_load_custom_quantization
+
                     def _load_draft():
-                        draft_model, _ = mlx_lm_load(specprefill_draft)
-                        return draft_model
+                        from ..patches.mlx_lm_mtp import set_mtp_active
+
+                        was_mtp = False
+                        try:
+                            from ..patches.mlx_lm_mtp import is_mtp_active
+
+                            was_mtp = is_mtp_active()
+                        except Exception:
+                            pass
+                        set_mtp_active(False)
+                        try:
+                            custom_loaded = maybe_load_custom_quantization(
+                                specprefill_draft,
+                                is_vlm=False,
+                            )
+                            if custom_loaded is not None:
+                                draft_model, _ = custom_loaded
+                                return draft_model
+                            draft_model, _ = mlx_lm_load(specprefill_draft)
+                            return draft_model
+                        finally:
+                            set_mtp_active(was_mtp)
                     draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)
                     self._engine.engine.scheduler.set_specprefill_draft_model(
                         draft_model, draft_model_name=specprefill_draft
@@ -1548,7 +1652,8 @@ class VLMBatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
-        request_id = await self._engine.add_request(
+        engine = self._engine
+        request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             vlm_inputs_embeds=vlm_inputs_embeds,
@@ -1561,7 +1666,7 @@ class VLMBatchedEngine(BaseEngine):
 
         finished_normally = False
         try:
-            async for output in self._engine.stream_outputs(request_id):
+            async for output in engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
                 if output.finished:
@@ -1582,7 +1687,7 @@ class VLMBatchedEngine(BaseEngine):
         finally:
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
-                await self._engine.abort_request(request_id)
+                await engine.abort_request(request_id)
 
     async def chat(
         self,

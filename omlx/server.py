@@ -133,6 +133,7 @@ from .api.responses_utils import (
     ResponseStateNotFoundError,
     build_function_call_output_item,
     build_message_output_item,
+    build_reasoning_output_item,
     build_response_store_record,
     build_response_usage,
     convert_responses_input_to_messages,
@@ -164,6 +165,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    SchedulerQueueFullError,
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
@@ -341,6 +343,8 @@ async def lifespan(app: FastAPI):
                 settings_manager=_server_state.settings_manager,
                 prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
                 global_settings=_server_state.global_settings,
+                soft_threshold=_server_state.global_settings.memory.soft_threshold,
+                hard_threshold=_server_state.global_settings.memory.hard_threshold,
             )
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -524,6 +528,32 @@ async def validation_exception_handler(
     else:
         content = {"detail": exc.errors()}
     return JSONResponse(status_code=422, content=content)
+
+
+@app.exception_handler(SchedulerQueueFullError)
+async def scheduler_queue_full_handler(
+    request: FastAPIRequest, exc: SchedulerQueueFullError
+):
+    """Map scheduler queue cap exhaustion to HTTP 503 + Retry-After."""
+    logger.warning(
+        "%s %s → 503: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    detail = (
+        f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
+        f"Try again shortly."
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(detail, 503)
+    else:
+        content = {"detail": detail}
+    return JSONResponse(
+        status_code=503,
+        content=content,
+        headers={"Retry-After": "1"},
+    )
 
 
 @app.exception_handler(Exception)
@@ -1136,7 +1166,7 @@ def init_server(
     logger.info(f"CORS origins: {cors_origins}")
 
     # Initialize model settings manager
-    base_path = Path(global_settings.base_path) if global_settings else Path(model_dir)
+    base_path = Path(global_settings.base_path) if global_settings else Path.home() / ".omlx"
     _server_state.settings_manager = ModelSettingsManager(base_path)
 
     # Get pinned models from settings file only (managed via admin page)
@@ -1997,7 +2027,7 @@ async def create_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}")
 
         get_server_metrics().record_request_complete(
             prompt_tokens=total_prompt_tokens,
@@ -2017,8 +2047,10 @@ async def create_completion(
                 prompt_tokens_details=PromptTokensDetails(
                     cached_tokens=total_cached_tokens,
                 ),
+                model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
+                total_time=round(elapsed, 2),
             ),
-        ).model_dump_json()
+        ).model_dump_json(exclude_none=True)
 
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_completion()),
@@ -2291,7 +2323,7 @@ async def create_chat_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {output.prompt_tokens}")
 
         get_server_metrics().record_request_complete(
             prompt_tokens=output.prompt_tokens,
@@ -2374,8 +2406,10 @@ async def create_chat_completion(
                 prompt_tokens_details=PromptTokensDetails(
                     cached_tokens=output.cached_tokens,
                 ),
+                model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
+                total_time=round(elapsed, 2),
             ),
-        ).model_dump_json()
+        ).model_dump_json(exclude_none=True)
 
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
@@ -2686,6 +2720,8 @@ async def stream_completion(
             generation_duration=gen_duration,
             model_id=resolve_model_id(request.model) or request.model,
         )
+        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(f"Completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -2996,6 +3032,8 @@ async def stream_chat_completion(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
+        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(f"Chat completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -3148,17 +3186,33 @@ async def stream_anthropic_messages(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
-                        # Close thinking block if transitioning to text
-                        if thinking_block_started and not text_block_started:
-                            yield create_content_block_stop_event(index=block_index)
-                            block_index += 1
-                            thinking_block_started = False
-                        if not text_block_started:
-                            yield create_content_block_start_event(
-                                index=block_index, block_type="text"
-                            )
-                            text_block_started = True
-                        yield create_text_delta_event(index=block_index, text=content_delta)
+                        # When tools are requested AND we haven't yet opened
+                        # a text block, drop pure-whitespace deltas. Models
+                        # often emit a leading newline around <tool_call>
+                        # envelopes that tool_filter passes through
+                        # (whitespace isn't part of the envelope markers).
+                        # Without this guard, the `\n` opens a text block
+                        # that then holds only whitespace — surfacing as
+                        # a phantom empty-ish text block before the
+                        # tool_use blocks.
+                        if (
+                            not text_block_started
+                            and kwargs.get("tools")
+                            and not content_delta.strip()
+                        ):
+                            pass  # drop leading whitespace adjacent to tool envelopes
+                        else:
+                            # Close thinking block if transitioning to text
+                            if thinking_block_started and not text_block_started:
+                                yield create_content_block_stop_event(index=block_index)
+                                block_index += 1
+                                thinking_block_started = False
+                            if not text_block_started:
+                                yield create_content_block_start_event(
+                                    index=block_index, block_type="text"
+                                )
+                                text_block_started = True
+                            yield create_text_delta_event(index=block_index, text=content_delta)
 
             if output.finished:
                 break
@@ -3229,19 +3283,8 @@ async def stream_anthropic_messages(
                 text_block_started = True
             yield create_text_delta_event(index=block_index, text=remaining)
 
-    # 4. Close open blocks
-    if thinking_block_started and not text_block_started:
-        # Only thinking was emitted, close it
-        yield create_content_block_stop_event(index=block_index)
-        block_index += 1
-    if text_block_started:
-        yield create_content_block_stop_event(index=block_index)
-    elif not thinking_block_started:
-        # No content at all - create empty text block
-        yield create_content_block_start_event(index=block_index, block_type="text")
-        yield create_content_block_stop_event(index=block_index)
-
-    # 5. Handle tool calls
+    # 5. Handle tool calls (moved before block-closing so empty-text-block
+    # emission can skip when tool_use blocks will follow).
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
@@ -3272,6 +3315,22 @@ async def stream_anthropic_messages(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
 
+    # 4. Close open blocks
+    if thinking_block_started and not text_block_started:
+        # Only thinking was emitted, close it
+        yield create_content_block_stop_event(index=block_index)
+        block_index += 1
+    if text_block_started:
+        yield create_content_block_stop_event(index=block_index)
+    elif not thinking_block_started and not tool_calls:
+        # No content AND no tool_calls — emit an empty text block so the
+        # message is well-formed. When tool_calls will follow, skip this —
+        # the tool_use blocks carry the semantic content, and an empty
+        # preceding text block confuses SDK clients that treat content[0]
+        # as authoritative.
+        yield create_content_block_start_event(index=block_index, block_type="text")
+        yield create_content_block_stop_event(index=block_index)
+
     # Reverse Gemma 4 parameter renaming
     if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
         for tc in tool_calls:
@@ -3284,7 +3343,14 @@ async def stream_anthropic_messages(
                     pass
 
     # Emit tool_use blocks if present
-    tool_block_start = block_index + 1
+    # When neither text nor thinking was streamed AND the empty-text-block
+    # emission was skipped (because tool_calls are about to follow), the
+    # tool_use block takes index 0. Otherwise it follows the last emitted
+    # text/thinking block at block_index+1.
+    if not text_block_started and not thinking_block_started:
+        tool_block_start = 0
+    else:
+        tool_block_start = block_index + 1
     if tool_calls:
         for i, tc in enumerate(tool_calls, start=tool_block_start):
             # Start tool_use block
@@ -3914,9 +3980,9 @@ async def create_response(
     # for it (Qwen 3.6+). Gated on detection so other templates don't
     # receive an unknown kwarg.
     _entry = get_engine_pool().get_entry(resolved_model)
+    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if (
-        _entry is not None
-        and _entry.preserve_thinking_default is True
+        native_reasoning
         and merged_ct_kwargs.get("enable_thinking") is not False
         and "preserve_thinking" not in merged_ct_kwargs
     ):
@@ -3950,6 +4016,7 @@ async def create_response(
                     model_load_duration=model_load_duration,
                     resolved_model=resolved_model,
                     response_format=response_format,
+                    native_reasoning=native_reasoning,
                     **chat_kwargs,
                 ),
                 http_request=http_request,
@@ -3981,7 +4048,9 @@ async def create_response(
 
         # Process output text
         raw_text = clean_special_tokens(output.text) if output.text else ""
-        thinking_content, regular_content = extract_thinking(raw_text)
+        thinking_content, regular_content = extract_thinking(
+            raw_text, start_in_thinking=native_reasoning
+        )
 
         # Parse tool calls
         if engine.model_type == "gpt_oss" and output.tool_calls:
@@ -4022,6 +4091,9 @@ async def create_response(
 
         # Build output items
         output_items: list[OutputItem] = []
+        reasoning_text = (thinking_content or "").strip()
+        if native_reasoning and reasoning_text:
+            output_items.append(build_reasoning_output_item(reasoning_text))
         output_items.append(
             build_message_output_item(cleaned_text.strip() if cleaned_text else "")
         )
@@ -4046,8 +4118,15 @@ async def create_response(
                     )
                 )
 
+        reasoning_token_count = (
+            len(engine.tokenizer.encode(reasoning_text))
+            if reasoning_text else 0
+        )
         usage = build_response_usage(
-            output.prompt_tokens, output.completion_tokens, output.cached_tokens
+            input_tokens=output.prompt_tokens,
+            output_tokens=output.completion_tokens,
+            reasoning_tokens=reasoning_token_count,
+            cached_tokens=output.cached_tokens,
         )
 
         response_obj = ResponseObject(
@@ -4087,6 +4166,7 @@ async def stream_responses_api(
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     response_format=None,
+    native_reasoning: bool = False,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -4096,12 +4176,21 @@ async def stream_responses_api(
     first_token_time = None
     last_output = None
     accumulated_text = ""
+    accumulated_reasoning = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser()
+    thinking_parser = ThinkingParser(start_in_thinking=native_reasoning)
     seq = 0
 
     response_id = generate_id(IDPrefix.RESPONSE)
     msg_id = generate_id(IDPrefix.MESSAGE)
+    reasoning_id = generate_id(IDPrefix.REASONING)
+
+    # Lazy item emission state — items are opened on first token
+    reasoning_opened = False
+    reasoning_closed = False
+    message_opened = False
+    next_output_index = 0
+    reasoning_output_index: Optional[int] = None  # captured when reasoning opens
 
     # Build initial response object (in_progress, empty output)
     initial_response = ResponseObject(
@@ -4134,35 +4223,114 @@ async def stream_responses_api(
         "sequence_number": seq,
     })
 
-    # 3. response.output_item.added (message)
-    msg_item = {
-        "type": "message",
-        "id": msg_id,
-        "status": "in_progress",
-        "role": "assistant",
-        "content": [],
-    }
-    seq += 1
-    yield format_sse_event("response.output_item.added", {
-        "type": "response.output_item.added",
-        "output_index": 0,
-        "item": msg_item,
-        "sequence_number": seq,
-    })
+    # --- helper closures for lazy item emission ----------------------
+    def _open_reasoning():
+        nonlocal seq, reasoning_opened, reasoning_output_index
+        if reasoning_opened:
+            return []
+        reasoning_opened = True
+        reasoning_output_index = next_output_index
+        events = []
+        seq += 1
+        events.append(format_sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": reasoning_output_index,
+            "item": {
+                "type": "reasoning",
+                "id": reasoning_id,
+                "status": "in_progress",
+                "summary": [],
+            },
+            "sequence_number": seq,
+        }))
+        seq += 1
+        events.append(format_sse_event("response.reasoning_summary_part.added", {
+            "type": "response.reasoning_summary_part.added",
+            "item_id": reasoning_id,
+            "output_index": reasoning_output_index,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": ""},
+            "sequence_number": seq,
+        }))
+        return events
 
-    # 4. response.content_part.added
-    content_part = {"type": "output_text", "text": "", "annotations": []}
-    seq += 1
-    yield format_sse_event("response.content_part.added", {
-        "type": "response.content_part.added",
-        "item_id": msg_id,
-        "output_index": 0,
-        "content_index": 0,
-        "part": content_part,
-        "sequence_number": seq,
-    })
+    def _close_reasoning():
+        nonlocal seq, reasoning_closed, next_output_index
+        if reasoning_closed or not reasoning_opened:
+            return []
+        reasoning_closed = True
+        next_output_index += 1
+        events = []
+        seq += 1
+        events.append(format_sse_event("response.reasoning_summary_text.done", {
+            "type": "response.reasoning_summary_text.done",
+            "item_id": reasoning_id,
+            "output_index": reasoning_output_index,
+            "summary_index": 0,
+            "text": accumulated_reasoning,
+            "sequence_number": seq,
+        }))
+        seq += 1
+        events.append(format_sse_event("response.reasoning_summary_part.done", {
+            "type": "response.reasoning_summary_part.done",
+            "item_id": reasoning_id,
+            "output_index": reasoning_output_index,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": accumulated_reasoning},
+            "sequence_number": seq,
+        }))
+        seq += 1
+        events.append(format_sse_event("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": reasoning_output_index,
+            "item": {
+                "type": "reasoning",
+                "id": reasoning_id,
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
+            },
+            "sequence_number": seq,
+        }))
+        return events
 
-    # 5. Stream tokens
+    def _open_message():
+        nonlocal seq, message_opened, next_output_index
+        if message_opened:
+            return []
+        message_opened = True
+        msg_output_index = next_output_index
+        events = []
+        seq += 1
+        events.append(format_sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": msg_output_index,
+            "item": {
+                "type": "message",
+                "id": msg_id,
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
+            "sequence_number": seq,
+        }))
+        seq += 1
+        events.append(format_sse_event("response.content_part.added", {
+            "type": "response.content_part.added",
+            "item_id": msg_id,
+            "output_index": msg_output_index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+            "sequence_number": seq,
+        }))
+        return events
+    # -----------------------------------------------------------------
+
+    # If not native reasoning, open message immediately (legacy behavior)
+    if not native_reasoning:
+        for ev in _open_message():
+            yield ev
+
+    # Stream tokens
     tool_filter = None
     stream_content = True
     if has_tools:
@@ -4171,6 +4339,8 @@ async def stream_responses_api(
             tool_filter = _f
         else:
             stream_content = False
+
+    msg_output_index = None  # will be set when message opens
 
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
@@ -4181,8 +4351,30 @@ async def stream_responses_api(
                 accumulated_text += output.new_text
 
             if stream_content and output.new_text:
-                _thinking, content_delta = thinking_parser.feed(output.new_text)
+                thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+
+                if thinking_delta and native_reasoning:
+                    accumulated_reasoning += thinking_delta
+                    for ev in _open_reasoning():
+                        yield ev
+                    seq += 1
+                    yield format_sse_event("response.reasoning_summary_text.delta", {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": reasoning_id,
+                        "output_index": reasoning_output_index,
+                        "summary_index": 0,
+                        "delta": thinking_delta,
+                        "sequence_number": seq,
+                    })
+
                 if content_delta:
+                    if native_reasoning and reasoning_opened and not reasoning_closed:
+                        for ev in _close_reasoning():
+                            yield ev
+                    for ev in _open_message():
+                        yield ev
+                    if msg_output_index is None:
+                        msg_output_index = next_output_index
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
@@ -4190,7 +4382,7 @@ async def stream_responses_api(
                         yield format_sse_event("response.output_text.delta", {
                             "type": "response.output_text.delta",
                             "item_id": msg_id,
-                            "output_index": 0,
+                            "output_index": msg_output_index,
                             "content_index": 0,
                             "delta": content_delta,
                             "sequence_number": seq,
@@ -4205,9 +4397,22 @@ async def stream_responses_api(
         })
         return
 
+    # Close reasoning if still open
+    if native_reasoning and reasoning_opened and not reasoning_closed:
+        for ev in _close_reasoning():
+            yield ev
+
+    # Ensure message item is opened (even if no content was streamed)
+    for ev in _open_message():
+        yield ev
+    if msg_output_index is None:
+        msg_output_index = next_output_index
+
     # Flush remaining content from parsers
     if stream_content:
-        _thinking, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish()
+        if thinking_delta and native_reasoning:
+            accumulated_reasoning += thinking_delta
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
@@ -4216,7 +4421,7 @@ async def stream_responses_api(
                 yield format_sse_event("response.output_text.delta", {
                     "type": "response.output_text.delta",
                     "item_id": msg_id,
-                    "output_index": 0,
+                    "output_index": msg_output_index,
                     "content_index": 0,
                     "delta": content_delta,
                     "sequence_number": seq,
@@ -4228,7 +4433,7 @@ async def stream_responses_api(
                 yield format_sse_event("response.output_text.delta", {
                     "type": "response.output_text.delta",
                     "item_id": msg_id,
-                    "output_index": 0,
+                    "output_index": msg_output_index,
                     "content_index": 0,
                     "delta": remaining,
                     "sequence_number": seq,
@@ -4241,7 +4446,9 @@ async def stream_responses_api(
         tool_calls = last_output.tool_calls
         cleaned_text = ""
     elif has_tools and accumulated_text:
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text, start_in_thinking=native_reasoning
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -4255,14 +4462,16 @@ async def stream_responses_api(
             yield format_sse_event("response.output_text.delta", {
                 "type": "response.output_text.delta",
                 "item_id": msg_id,
-                "output_index": 0,
+                "output_index": msg_output_index,
                 "content_index": 0,
                 "delta": cleaned_text,
                 "sequence_number": seq,
             })
     else:
         # No tools — use raw accumulated text minus thinking
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text, start_in_thinking=native_reasoning
+        )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     # Reverse Gemma 4 parameter renaming
@@ -4289,33 +4498,33 @@ async def stream_responses_api(
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 
-    # 6. response.output_text.done
+    # response.output_text.done
     seq += 1
     yield format_sse_event("response.output_text.done", {
         "type": "response.output_text.done",
         "item_id": msg_id,
-        "output_index": 0,
+        "output_index": msg_output_index,
         "content_index": 0,
         "text": final_text,
         "sequence_number": seq,
     })
 
-    # 7. response.content_part.done
+    # response.content_part.done
     seq += 1
     yield format_sse_event("response.content_part.done", {
         "type": "response.content_part.done",
         "item_id": msg_id,
-        "output_index": 0,
+        "output_index": msg_output_index,
         "content_index": 0,
         "part": {"type": "output_text", "text": final_text, "annotations": []},
         "sequence_number": seq,
     })
 
-    # 8. response.output_item.done (message)
+    # response.output_item.done (message)
     seq += 1
     yield format_sse_event("response.output_item.done", {
         "type": "response.output_item.done",
-        "output_index": 0,
+        "output_index": msg_output_index,
         "item": {
             "type": "message",
             "id": msg_id,
@@ -4327,19 +4536,25 @@ async def stream_responses_api(
     })
 
     # Build output items for final response
-    output_items = [
-        {
-            "type": "message",
-            "id": msg_id,
+    output_items = []
+    if native_reasoning and accumulated_reasoning:
+        output_items.append({
+            "type": "reasoning",
+            "id": reasoning_id,
             "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": final_text, "annotations": []}],
-        }
-    ]
+            "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
+        })
+    output_items.append({
+        "type": "message",
+        "id": msg_id,
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": final_text, "annotations": []}],
+    })
 
-    # 9-12. Emit function call items if present
+    # Emit function call items if present
     if tool_calls:
-        output_index = 1
+        output_index = next_output_index + 1
         for tc in tool_calls:
             if hasattr(tc, "function"):
                 call_id = tc.id
@@ -4425,12 +4640,16 @@ async def stream_responses_api(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
+        reasoning_token_count = (
+            len(engine.tokenizer.encode(accumulated_reasoning))
+            if accumulated_reasoning else 0
+        )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,
             "output_tokens": last_output.completion_tokens,
             "total_tokens": last_output.prompt_tokens + last_output.completion_tokens,
             "input_tokens_details": {"cached_tokens": last_output.cached_tokens},
-            "output_tokens_details": {"reasoning_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
 
     # 13. response.completed — MUST always be sent

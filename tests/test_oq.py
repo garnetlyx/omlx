@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for oQ (oMLX Universal Dynamic Quantization)."""
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -36,6 +37,7 @@ from omlx.oq import (
     _is_moe_router,
     _is_vision_tensor,
     _LazyTensorIndex,
+    _measure_sensitivity,
     _normalize_quant_path,
     _quantize_chunked,
     _should_quantize_tensor,
@@ -1273,10 +1275,39 @@ class TestTrackedTensor:
         # no-args reverses all axes
         assert t.transpose().transform == "transpose_2_1_0"
 
-    def test_getitem_ellipsis_raises(self):
+    def test_getitem_ellipsis_half_split(self):
+        # Sanitize patterns like gate_up[..., :mid, :] must round-trip through
+        # the tracked-tensor dry run so streaming discovery covers low-RAM
+        # quantization paths (see #1204).
+        t = _TrackedTensor((256, 2048, 384), "F16", sources=["gate_up"])
+        first = t[..., :1024, :]
+        assert first.shape == (256, 1024, 384)
+        assert first.transform == "split_0_2"
+        assert first.axis == 1
+        second = t[..., 1024:, :]
+        assert second.transform == "split_1_2"
+
+    def test_getitem_ellipsis_trailing(self):
+        t = _TrackedTensor((4, 8, 16), "F16", sources=["a"])
+        r = t[..., :4]
+        assert r.shape == (4, 8, 4)
+        assert r.transform == "slice"
+
+    def test_getitem_ellipsis_zero_pad(self):
+        # Ellipsis with no axes to fill (rank already covered)
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t[..., 0:4, :]
+        assert r.shape == (4, 8)
+
+    def test_getitem_ellipsis_middle(self):
+        t = _TrackedTensor((2, 3, 4, 5), "F16", sources=["a"])
+        r = t[0, ..., 2:4]
+        assert r.shape == (3, 4, 2)
+
+    def test_getitem_multiple_ellipsis_raises(self):
         t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
-        with pytest.raises(NotImplementedError):
-            t[..., :2]
+        with pytest.raises(ValueError):
+            t[..., :2, ...]
 
     def test_size_property(self):
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
@@ -1508,6 +1539,63 @@ class TestSensitivityRequiredEnforcement:
                 str(tmp_path / "out"),
                 4,
                 auto_proxy_sensitivity=False,
+            )
+
+    def test_streaming_discovery_failure_with_model_exceeding_ram_raises(
+        self, tmp_path, monkeypatch
+    ):
+        """#1204: discovery failure + model > RAM must hard-fail. The old
+        behaviour was a silent ``logger.error`` followed by the source weight
+        names landing in the output, which loaded with "Received N parameters
+        not in model".
+
+        Sensitivity measurement runs before sanitize-plan discovery, so
+        reaching the discovery block with the model over RAM means the
+        auto-proxy sensitivity path has to succeed first; the proxy build and
+        measurement are stubbed so the run gets as far as discovery."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        from omlx import settings as _settings
+
+        monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
+
+        from omlx import oq as _oq
+
+        # Stub the auto-proxy sensitivity path so the run reaches discovery.
+        monkeypatch.setattr(
+            _oq, "_build_proxy_for_sensitivity", lambda *a, **k: tmp_path / "proxy"
+        )
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity_from_quantized_model", lambda *a, **k: {0: 0.1}
+        )
+
+        # Force a sanitize_fn that fails during the tracked-tensor dry run,
+        # mimicking an indexing pattern _TrackedTensor cannot trace.
+        def _broken_sanitize(weights):
+            raise NotImplementedError("simulated unsupported indexing pattern")
+
+        monkeypatch.setattr(
+            _oq, "_build_model_sanitizer", lambda *a, **k: _broken_sanitize
+        )
+
+        with pytest.raises(
+            RuntimeError, match="streaming sanitize-plan discovery failed"
+        ):
+            quantize_oq_streaming(
+                str(src),
+                str(tmp_path / "out"),
+                4,
+                auto_proxy_sensitivity=True,
             )
 
     def test_proxy_build_failure_raises(self, tmp_path, monkeypatch):
@@ -2063,4 +2151,382 @@ class TestBuildModelSanitizerTextOnly:
 
 
 # =============================================================================
-# Test GPTQ quantization
+# Test _build_proxy_for_sensitivity MTP patch integration
+# =============================================================================
+
+
+class TestBuildProxyForSensitivityMtpPatch:
+    """Tests for the MTP patch gating in _build_proxy_for_sensitivity.
+
+    The function must temporarily activate the MTP patch during
+    ``mlx_lm.convert()`` so that MTP-bearing models (Qwen3.5, DeepSeek-V4)
+    are converted correctly. After conversion the previous MTP state must
+    be restored regardless of success or failure.
+    """
+
+    def _make_mocks(self, patch_return=True, is_active=False, convert_side_effect=None):
+        mock_apply = MagicMock(return_value=patch_return)
+        mock_is_active = MagicMock(return_value=is_active)
+        mock_set_active = MagicMock()
+        mock_convert = MagicMock(side_effect=convert_side_effect)
+        return (
+            MagicMock(
+                apply_mlx_lm_mtp_patch=mock_apply,
+                is_mtp_active=mock_is_active,
+                set_mtp_active=mock_set_active,
+            ),
+            mock_apply, mock_is_active, mock_set_active, mock_convert,
+        )
+
+    def _patch(self, monkeypatch, mtp_mod, mock_convert):
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", mtp_mod)
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
+
+    def test_happy_path_with_active_patch(self, tmp_path, monkeypatch):
+        """MTP patch applied → state toggled → convert called with correct kwargs → state restored."""
+        mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = self._make_mocks()
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        result = _build_proxy_for_sensitivity(
+            "/my/model", dtype="bfloat16", working_dir=str(tmp_path), trust_remote_code=True,
+        )
+
+        assert isinstance(result, Path)
+        assert result.name.startswith("omlx_oq_proxy_")
+        assert result.parent == tmp_path
+
+        mock_apply.assert_called_once()
+        assert mock_set_active.call_count == 2
+        assert mock_set_active.call_args_list[0] == ((True,),)
+        assert mock_set_active.call_args_list[-1] == ((False,),)
+
+        kw = mock_convert.call_args.kwargs
+        assert kw["hf_path"] == "/my/model"
+        assert kw["quantize"] is True
+        assert kw["q_bits"] == _PROXY_QUANT_BITS
+        assert kw["q_group_size"] == _PROXY_QUANT_GROUP_SIZE
+        assert kw["q_mode"] == "affine"
+        assert kw["dtype"] == "bfloat16"
+        assert kw["trust_remote_code"] is True
+
+    @pytest.mark.parametrize("prev_state", [False, True])
+    def test_state_restored_on_error(self, tmp_path, monkeypatch, prev_state):
+        """Convert error → finally block restores previous MTP state."""
+        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(
+            convert_side_effect=RuntimeError("boom"), is_active=prev_state,
+        )
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _build_proxy_for_sensitivity(
+                "/fake/model", dtype="float16", working_dir=str(tmp_path),
+            )
+
+        assert mock_set_active.call_count == 2
+        assert mock_set_active.call_args_list[-1] == ((prev_state,),)
+
+    def test_patch_returns_false_no_toggle(self, tmp_path, monkeypatch):
+        """apply_mlx_lm_mtp_patch returns False → no MTP toggle, convert is still called."""
+        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(patch_return=False)
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        _build_proxy_for_sensitivity(
+            "/fake/model", dtype="float16", working_dir=str(tmp_path),
+        )
+
+        mock_set_active.assert_not_called()
+        mock_convert.assert_called_once()
+
+    def test_import_fails_graceful_degradation(self, tmp_path, monkeypatch):
+        """MTP patch import raises → function proceeds without MTP gating."""
+        mock_convert = MagicMock()
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", None)
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
+
+        result = _build_proxy_for_sensitivity(
+            "/fake/model", dtype="float16", working_dir=str(tmp_path),
+        )
+
+        assert isinstance(result, Path)
+        mock_convert.assert_called_once()
+
+
+# =============================================================================
+# Test _measure_sensitivity MTP patch integration (VLM path)
+# =============================================================================
+
+
+class TestMeasureSensitivityVlmMtp:
+    """_measure_sensitivity must attach the MTP head for VLM checkpoints that
+    declare MTP heads.
+
+    mlx-vlm skips Model.sanitize for MLX-format checkpoints, so the
+    language_model.mtp.* weights stay in the weight dict. Without an attached
+    MTP head load_weights(strict=True) rejects them and the measurement
+    silently returns {}. The function must apply the mlx-vlm runtime MTP
+    patch and toggle mtp_active True for the load, then restore the previous
+    state. The text path needs no toggle (the patched qwen35_model.sanitize
+    self-consistently strips mtp.* when no head is attached).
+    """
+
+    def _patch_common(self, monkeypatch, has_mtp, prev_active=False):
+        from omlx import oq as oq_mod
+
+        mock_apply_runtime = MagicMock()
+        mock_set_active = MagicMock()
+        mock_is_active = MagicMock(return_value=prev_active)
+
+        monkeypatch.setitem(
+            sys.modules, "omlx.utils.model_loading",
+            MagicMock(
+                maybe_apply_pre_load_patches=MagicMock(),
+                _has_mtp_heads=MagicMock(return_value=has_mtp),
+            ),
+        )
+        monkeypatch.setitem(
+            sys.modules, "omlx.patches.mlx_lm_mtp",
+            MagicMock(is_mtp_active=mock_is_active, set_mtp_active=mock_set_active),
+        )
+        monkeypatch.setitem(
+            sys.modules, "omlx.patches.mlx_vlm_mtp",
+            MagicMock(apply_mlx_vlm_mtp_runtime_patch=mock_apply_runtime),
+        )
+        monkeypatch.setitem(sys.modules, "mlx_vlm", MagicMock())
+        monkeypatch.setitem(
+            sys.modules, "mlx_vlm.utils",
+            MagicMock(load_model=MagicMock(return_value=MagicMock())),
+        )
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock())
+        monkeypatch.setitem(
+            sys.modules, "mlx_lm.tokenizer_utils",
+            MagicMock(load=MagicMock(return_value=MagicMock())),
+        )
+        monkeypatch.setattr(
+            oq_mod, "_measure_sensitivity_from_model",
+            MagicMock(return_value={0: 0.1}),
+        )
+        return mock_apply_runtime, mock_set_active
+
+    def test_vlm_with_mtp_heads_attaches_head(self, monkeypatch):
+        """VLM + MTP heads → runtime patch applied, mtp_active toggled True for load."""
+        mock_apply_runtime, mock_set_active = self._patch_common(
+            monkeypatch, has_mtp=True,
+        )
+
+        result = _measure_sensitivity(
+            "/fake/vlm-mtp", {"vision_config": {}}, 6,
+        )
+
+        assert result == {0: 0.1}
+        mock_apply_runtime.assert_called_once()
+        assert mock_set_active.call_args_list[0] == ((True,),)
+        assert mock_set_active.call_args_list[-1] == ((False,),)
+
+    @pytest.mark.parametrize("prev_active", [False, True])
+    def test_mtp_active_restored_after_load(self, monkeypatch, prev_active):
+        """The previous mtp_active state is restored once the load returns."""
+        _, mock_set_active = self._patch_common(
+            monkeypatch, has_mtp=True, prev_active=prev_active,
+        )
+
+        _measure_sensitivity("/fake/vlm-mtp", {"vision_config": {}}, 6)
+
+        assert mock_set_active.call_args_list[-1] == ((prev_active,),)
+
+    def test_vlm_without_mtp_heads_no_toggle(self, monkeypatch):
+        """VLM without MTP heads → no runtime patch, no mtp_active toggle."""
+        mock_apply_runtime, mock_set_active = self._patch_common(
+            monkeypatch, has_mtp=False,
+        )
+
+        _measure_sensitivity("/fake/vlm", {"vision_config": {}}, 6)
+
+        mock_apply_runtime.assert_not_called()
+        mock_set_active.assert_not_called()
+
+    def test_text_model_no_vlm_toggle(self, monkeypatch):
+        """Text checkpoint → VLM MTP toggling is skipped entirely."""
+        mock_apply_runtime, mock_set_active = self._patch_common(
+            monkeypatch, has_mtp=True,
+        )
+        monkeypatch.setitem(
+            sys.modules, "mlx_lm",
+            MagicMock(load=MagicMock(return_value=(MagicMock(), MagicMock()))),
+        )
+
+        _measure_sensitivity("/fake/text", {}, 6)
+
+        mock_apply_runtime.assert_not_called()
+        mock_set_active.assert_not_called()
+
+
+# =============================================================================
+# Test pre-computed sensitivity map loading (oq_sensitivity_map.json)
+# =============================================================================
+
+
+class TestPrecomputedSensitivityMap:
+    """Tests for the oq_sensitivity_map.json disk cache feature.
+
+    When a pre-computed sensitivity map file exists at
+    ``{model_path}/oq_sensitivity_map.json``, quantize_oq_streaming loads it
+    directly and skips the entire sensitivity measurement pipeline
+    (proxy building, model loading, calibration, etc.).
+    """
+
+    def test_loads_existing_sensitivity_map_and_skips_measurement(
+        self, tmp_path, monkeypatch
+    ):
+        """When oq_sensitivity_map.json exists, it is loaded and measurement
+        functions are never called."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        sensitivity_map = {"0": 0.05, "1": 0.03, "2": 0.01}
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps(sensitivity_map), encoding="utf-8"
+        )
+
+        from omlx import oq as _oq
+
+        # Stub all measurement functions — they should NOT be called
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity", MagicMock(side_effect=RuntimeError("should not call"))
+        )
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity_from_quantized_model",
+            MagicMock(side_effect=RuntimeError("should not call")),
+        )
+        monkeypatch.setattr(
+            _oq, "_build_proxy_for_sensitivity",
+            MagicMock(side_effect=RuntimeError("should not call")),
+        )
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        _oq._measure_sensitivity.assert_not_called()
+        _oq._measure_sensitivity_from_quantized_model.assert_not_called()
+        _oq._build_proxy_for_sensitivity.assert_not_called()
+
+    def test_sensitivity_map_used_in_quant_plan(
+        self, tmp_path, monkeypatch
+    ):
+        """The loaded sensitivity map is stored in config['_oq_sensitivity_map']
+        and flows into _build_quant_plan."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text(
+            json.dumps({
+                "model_type": "llama",
+                "num_hidden_layers": 32,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_attention_heads": 8,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 256,
+            })
+        )
+
+        sensitivity_map = {str(i): 0.1 / (i + 1) for i in range(32)}
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps(sensitivity_map), encoding="utf-8"
+        )
+
+        from omlx import oq as _oq
+
+        # Capture the config that flows into _build_quant_plan
+        captured_configs = []
+        original_build_plan = _oq._build_quant_plan
+
+        def _capture_build_plan(named_shapes, config, oq_level, **kwargs):
+            captured_configs.append(dict(config))
+            return original_build_plan(named_shapes, config, oq_level, **kwargs)
+
+        monkeypatch.setattr(_oq, "_build_quant_plan", _capture_build_plan)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        assert len(captured_configs) == 1
+        config = captured_configs[0]
+        assert "_oq_sensitivity_map" in config
+        loaded_sens = config["_oq_sensitivity_map"]
+        assert loaded_sens == sensitivity_map
+
+    def test_no_sensitivity_map_falls_back_to_measurement(
+        self, tmp_path, monkeypatch
+    ):
+        """When oq_sensitivity_map.json does NOT exist, measurement runs."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        from omlx import oq as _oq
+
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity",
+            MagicMock(return_value={"0": 0.05, "1": 0.03}),
+        )
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        _oq._measure_sensitivity.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("content,expected_exc,expected_match"),
+        [
+            ("{}", RuntimeError, "sensitivity measurement produced no scores"),
+            ("not valid json", ValueError, None),
+        ],
+    )
+    def test_sensitivity_map_file_errors(
+        self,
+        tmp_path,
+        monkeypatch,
+        content,
+        expected_exc,
+        expected_match,
+    ):
+        """Sensitivity map file issues (empty JSON or malformed JSON) should raise."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+        (src / "oq_sensitivity_map.json").write_text(content, encoding="utf-8")
+
+        with pytest.raises(expected_exc, match=expected_match or ".*"):
+            quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)

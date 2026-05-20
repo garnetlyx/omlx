@@ -73,6 +73,13 @@ class ServerManager:
         self._stop_health_check = threading.Event()
         self._adopted = False
 
+        # Persistent session for health checks. Reused across every poll so
+        # the underlying TCP connection is kept alive instead of opening a
+        # fresh socket per check (which lands in TIME_WAIT and, under server
+        # slowdown, can exhaust the host's ephemeral port range).
+        self._health_session = requests.Session()
+        self._health_session.trust_env = False
+
         # Health check failure tracking
         self._consecutive_health_failures: int = 0
         self._max_health_failures: int = 3  # 3 consecutive failures → UNRESPONSIVE
@@ -115,9 +122,7 @@ class ServerManager:
 
     def check_health(self) -> bool:
         try:
-            session = requests.Session()
-            session.trust_env = False
-            response = session.get(self._get_health_url(), timeout=2)
+            response = self._health_session.get(self._get_health_url(), timeout=2)
             return response.status_code == 200
         except requests.RequestException:
             return False
@@ -350,6 +355,14 @@ class ServerManager:
                 if p not in current:
                     current = p + ":" + current
             env["PATH"] = current
+
+            # Tell the server it is running under the menubar supervisor.
+            # The admin restart endpoint reads this to know whether the
+            # process will be revived after a self-SIGTERM. Set to a
+            # supervisor identifier rather than a bare "1" so future
+            # supervisor types (launchd, systemd, etc.) can advertise
+            # themselves independently.
+            env["OMLX_SUPERVISED"] = "menubar"
 
             self._process = subprocess.Popen(
                 cmd,

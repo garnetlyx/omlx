@@ -10,6 +10,63 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_VLM_TEXT_PREFIX = "language_model."
+
+_MLX_LM_LOAD_CONFIG_PATCHED = False
+
+
+def expand_per_layer_quant_keys(cfg: dict) -> dict:
+    """Add ``language_model.``-prefixed variants of per-layer quantization keys.
+
+    oQ writes per-layer overrides keyed by safetensors tensor base name
+    (e.g. ``"lm_head"``), but ``nn.quantize``'s class_predicate receives
+    model-tree paths (``"language_model.lm_head"``).  Without the prefixed
+    variant the lookup misses and the global bits are used, causing a
+    shape mismatch at ``load_weights``.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    for config_key in ("quantization", "quantization_config"):
+        quant = cfg.get(config_key)
+        if not isinstance(quant, dict):
+            continue
+        extras: dict[str, dict] = {}
+        for key, val in quant.items():
+            if not isinstance(val, dict):
+                continue
+            prefixed = _VLM_TEXT_PREFIX + key
+            if not key.startswith(_VLM_TEXT_PREFIX) and prefixed not in quant:
+                extras[prefixed] = val
+            elif key.startswith(_VLM_TEXT_PREFIX):
+                short = key[len(_VLM_TEXT_PREFIX):]
+                if short not in quant:
+                    extras[short] = val
+        if extras:
+            quant.update(extras)
+    return cfg
+
+
+def _patch_mlx_lm_load_config() -> None:
+    """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
+    global _MLX_LM_LOAD_CONFIG_PATCHED
+    if _MLX_LM_LOAD_CONFIG_PATCHED:
+        return
+
+    try:
+        import mlx_lm.utils as _lu
+    except ImportError:
+        return
+
+    _original = _lu.load_config
+
+    def _patched(model_path, *args, **kwargs):
+        cfg = _original(model_path, *args, **kwargs)
+        expand_per_layer_quant_keys(cfg)
+        return cfg
+
+    _lu.load_config = _patched
+    _MLX_LM_LOAD_CONFIG_PATCHED = True
+
 
 def maybe_apply_pre_load_patches(
     model_name: str,
@@ -29,6 +86,15 @@ def maybe_apply_pre_load_patches(
 
     Safe to call repeatedly; the patches are idempotent.
     """
+    # Reset the process-wide MTP flag so non-MTP-compatible models (or
+    # models with mtp_enabled=False) are not polluted by a prior model
+    # load that left the flag True.
+    from ..patches.mlx_lm_mtp import set_mtp_active
+
+    set_mtp_active(False)
+
+    _patch_mlx_lm_load_config()
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
@@ -83,6 +149,25 @@ def maybe_apply_pre_load_patches(
                     "(model has MTP heads but mtp_enabled=False; head not attached)",
                     model_name,
                 )
+
+        # mlx-vlm side: when the model loads via VLMBatchedEngine
+        # (e.g. ``qwen3_5_moe`` with vision_config), the mlx-lm patch
+        # alone can't attach an MTP head to the mlx-vlm classes.
+        # Apply the parallel runtime patch on mlx-vlm so the MTPModule is
+        # instantiated on ``LanguageModel.__init__``.
+        if mtp_enabled:
+            try:
+                from ..patches.mlx_vlm_mtp import (
+                    apply_mlx_vlm_mtp_runtime_patch,
+                )
+            except Exception:
+                pass
+            else:
+                if apply_mlx_vlm_mtp_runtime_patch():
+                    logger.info(
+                        "mlx-vlm runtime MTP patch applied for %s",
+                        model_name,
+                    )
     elif (
         model_settings is not None
         and getattr(model_settings, "mtp_enabled", False)
@@ -94,6 +179,26 @@ def maybe_apply_pre_load_patches(
             model_type,
             _has_mtp_heads(config),
         )
+
+    # qwen3_5_moe covers Qwen3.6 too (HF config sets model_type=qwen3_5_moe).
+    # The nested-visual sanitize wrap remaps language_model.model.visual.*
+    # to vision_tower.* for Qwen3.6's nested ViT layout. Wraps whichever
+    # Model.sanitize is current (stock mlx-vlm or mlx_vlm_mtp runtime), so
+    # the call has to land after apply_mlx_vlm_mtp_runtime_patch above.
+    # No-op when the wrap's already installed or mlx-vlm isn't importable.
+    if model_type and model_type.startswith("qwen3_5_moe"):
+        try:
+            from ..patches.qwen3_6_nested_visual import (
+                apply_qwen3_6_nested_visual_patch,
+            )
+        except Exception as e:
+            logger.debug("qwen3_6 nested-visual patch import failed: %s", e)
+        else:
+            if apply_qwen3_6_nested_visual_patch():
+                logger.info(
+                    "qwen3_6 nested-visual sanitize wrap applied for %s",
+                    model_name,
+                )
 
 
 def _has_mtp_heads(config: dict) -> bool:
@@ -176,3 +281,57 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
             logger.info(f"IndexCache applied: freq={index_cache_freq}")
 
     return model
+
+
+def maybe_load_custom_quantization(
+    model_name: str,
+    *,
+    is_vlm: bool,
+) -> tuple[Any, Any] | None:
+    """Load models that require a custom upstream quantization loader.
+
+    Returns ``None`` when the model does not declare a known custom
+    quantization method. The custom loaders (e.g. paroquant) handle
+    their own tokenizer/processor wiring, so omlx's tokenizer_config
+    and trust_remote_code are not forwarded.
+    """
+    config_path = Path(model_name) / "config.json"
+    if not config_path.exists():
+        return None
+
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception as e:
+        logger.debug(
+            "Could not read %s for custom quantization dispatch: %s",
+            config_path,
+            e,
+        )
+        return None
+
+    quant_config = config.get("quantization_config")
+    quant_method = quant_config.get("quant_method") if quant_config else None
+
+    if not quant_method:
+        return None
+
+    if quant_method.lower() == "paroquant":
+        try:
+            from paroquant.inference.backends.mlx.load import load as paro_load
+        except ImportError as e:
+            raise ImportError(
+                "This model uses ParoQuant. Install it separately with: "
+                'pip install "paroquant[mlx]"'
+            ) from e
+
+        model, processor, loaded_is_vlm = paro_load(model_name, force_text=not is_vlm)
+        if is_vlm and not loaded_is_vlm:
+            raise ValueError(
+                "ParoQuant loader returned a text-only model for VLM load: "
+                f"{model_name}"
+            )
+    else:
+        # The quant method may be already supported by mlx-lm; simply return None.
+        return None
+
+    return model, processor
