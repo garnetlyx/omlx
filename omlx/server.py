@@ -333,22 +333,26 @@ async def lifespan(app: FastAPI):
         _server_state.global_settings is not None
         and _server_state.engine_pool is not None
     ):
-        max_bytes = _server_state.global_settings.memory.get_max_process_memory_bytes()
-        if max_bytes is not None:
-            from .process_memory_enforcer import ProcessMemoryEnforcer
+        from .process_memory_enforcer import ProcessMemoryEnforcer
 
-            enforcer = ProcessMemoryEnforcer(
-                engine_pool=_server_state.engine_pool,
-                max_bytes=max_bytes,
-                settings_manager=_server_state.settings_manager,
-                prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
-                global_settings=_server_state.global_settings,
-                soft_threshold=_server_state.global_settings.memory.soft_threshold,
-                hard_threshold=_server_state.global_settings.memory.hard_threshold,
-            )
-            _server_state.process_memory_enforcer = enforcer
-            _server_state.engine_pool._process_memory_enforcer = enforcer
-            enforcer.start()
+        memory_settings = _server_state.global_settings.memory
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=_server_state.engine_pool,
+            memory_guard_tier=memory_settings.memory_guard_tier,
+            memory_guard_custom_ceiling_gb=memory_settings.memory_guard_custom_ceiling_gb,
+            settings_manager=_server_state.settings_manager,
+            prefill_memory_guard=memory_settings.prefill_memory_guard,
+            global_settings=_server_state.global_settings,
+            soft_threshold=memory_settings.soft_threshold,
+            hard_threshold=memory_settings.hard_threshold,
+            prefill_safe_zone_ratio=memory_settings.prefill_safe_zone_ratio,
+            prefill_min_chunk_tokens=memory_settings.prefill_min_chunk_tokens,
+        )
+        _server_state.process_memory_enforcer = enforcer
+        _server_state.engine_pool._process_memory_enforcer = enforcer
+        # Engine pool consults the enforcer for the pre-load ceiling.
+        _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
+        enforcer.start()
 
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
@@ -1100,7 +1104,6 @@ def validate_context_window(
 
 def init_server(
     model_dirs: str | list[str],
-    max_model_memory: int | None,
     scheduler_config=None,
     api_key: str | None = None,
     global_settings: object | None = None,
@@ -1110,7 +1113,6 @@ def init_server(
 
     Args:
         model_dirs: Path or list of paths to directories containing model subdirectories
-        max_model_memory: Maximum memory for loaded models in bytes, or None for no limit
         scheduler_config: Scheduler config for BatchedEngine
         api_key: API key for authentication (optional)
         global_settings: GlobalSettings instance (optional)
@@ -1202,9 +1204,10 @@ def init_server(
             model_path.mkdir(parents=True, exist_ok=True)
             logger.warning(f"Model directory created (empty): {md}")
 
-    # Create engine pool
+    # Create engine pool. The pool consults enforcer.get_final_ceiling()
+    # for pre-load admission — wired up later in startup once the enforcer
+    # is constructed.
     _server_state.engine_pool = EnginePool(
-        max_model_memory=max_model_memory,
         scheduler_config=scheduler_config,
     )
 
@@ -1243,10 +1246,11 @@ def init_server(
         logger.info(f"Default model: {_server_state.default_model}")
     else:
         logger.info("No default model (no models available)")
-    if max_model_memory is None:
-        logger.info("Max model memory: disabled (no limit)")
-    else:
-        logger.info(f"Max model memory: {format_size(max_model_memory)}")
+    if global_settings and getattr(global_settings, "memory", None):
+        logger.info(
+            f"Memory guard tier: {global_settings.memory.memory_guard_tier} "
+            f"(guard {'on' if global_settings.memory.prefill_memory_guard else 'off'})"
+        )
     logger.info(f"Default max tokens: {_server_state.sampling.max_tokens}")
     if api_key:
         logger.info("API key authentication: enabled")
@@ -1550,10 +1554,12 @@ async def health():
 
     pool_status = None
     if _server_state.engine_pool is not None:
+        enforcer = _server_state.process_memory_enforcer
+        ceiling = enforcer.get_final_ceiling() if enforcer is not None else 0
         pool_status = {
             "model_count": _server_state.engine_pool.model_count,
             "loaded_count": _server_state.engine_pool.loaded_model_count,
-            "max_model_memory": _server_state.engine_pool.max_model_memory,
+            "final_ceiling": ceiling,
             "current_model_memory": _server_state.engine_pool.current_model_memory,
         }
 
@@ -1588,7 +1594,10 @@ async def server_status(_: bool = Depends(verify_api_key)):
         models_loaded = pool.loaded_model_count
         loaded_models = pool.get_loaded_model_ids()
         model_memory_used = pool.current_model_memory
-        model_memory_max = pool.max_model_memory
+        enforcer = _server_state.process_memory_enforcer
+        model_memory_max = (
+            enforcer.get_final_ceiling() if enforcer is not None else None
+        )
         for entry in pool._entries.values():
             if entry.is_loading:
                 models_loading += 1
@@ -2137,11 +2146,15 @@ async def create_chat_completion(
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_dflash_vlm = (
+        not is_vlm
+        and getattr(engine, "supports_multimodal_fallback", False)
+    )
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
-    elif is_vlm:
-        # VLM: preserve image_url content parts for vision processing
+    elif is_vlm or is_dflash_vlm:
+        # VLM or DFlash with VLM fallback: preserve image_url content parts
         messages = extract_multimodal_content(
             request.messages,
             max_tool_result_tokens,
@@ -3317,9 +3330,9 @@ async def stream_anthropic_messages(
 
     # 4. Close open blocks
     if thinking_block_started and not text_block_started:
-        # Only thinking was emitted, close it
+        # Only thinking was emitted. Keep block_index on the just-closed
+        # block so following tool_use blocks start at the next contiguous index.
         yield create_content_block_stop_event(index=block_index)
-        block_index += 1
     if text_block_started:
         yield create_content_block_stop_event(index=block_index)
     elif not thinking_block_started and not tool_calls:
@@ -3486,6 +3499,10 @@ async def create_anthropic_message(
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
     is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_dflash_vlm = (
+        not is_vlm
+        and getattr(engine, "supports_multimodal_fallback", False)
+    )
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if engine.model_type == "gpt_oss":
@@ -3495,7 +3512,7 @@ async def create_anthropic_message(
     else:
         messages = convert_anthropic_to_internal(
             request, max_tool_result_tokens, engine.tokenizer,
-            preserve_images=is_vlm,
+            preserve_images=is_vlm or is_dflash_vlm,
             native_reasoning_content=native_reasoning,
         )
 
@@ -4048,9 +4065,7 @@ async def create_response(
 
         # Process output text
         raw_text = clean_special_tokens(output.text) if output.text else ""
-        thinking_content, regular_content = extract_thinking(
-            raw_text, start_in_thinking=native_reasoning
-        )
+        thinking_content, regular_content = extract_thinking(raw_text)
 
         # Parse tool calls
         if engine.model_type == "gpt_oss" and output.tool_calls:
@@ -4446,9 +4461,7 @@ async def stream_responses_api(
         tool_calls = last_output.tool_calls
         cleaned_text = ""
     elif has_tools and accumulated_text:
-        thinking_content, regular_content = extract_thinking(
-            accumulated_text, start_in_thinking=native_reasoning
-        )
+        thinking_content, regular_content = extract_thinking(accumulated_text)
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -4468,10 +4481,8 @@ async def stream_responses_api(
                 "sequence_number": seq,
             })
     else:
-        # No tools — use raw accumulated text minus thinking
-        thinking_content, regular_content = extract_thinking(
-            accumulated_text, start_in_thinking=native_reasoning
-        )
+        # No tools — use raw accumulated text minus thinking.
+        thinking_content, regular_content = extract_thinking(accumulated_text)
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     # Reverse Gemma 4 parameter renaming
@@ -4742,21 +4753,19 @@ async def init_mcp(config_path: str):
 
 def main():
     """Run the server (use omlx CLI instead)."""
-    from .config import parse_size
-
     parser = argparse.ArgumentParser(
         description="oMLX multi-model serving for Apple Silicon",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     # Multi-model serving
-    python -m omlx.server --model-dir /path/to/models --max-model-memory 32GB
+    python -m omlx.server --model-dir /path/to/models
 
     # With pinned models
-    python -m omlx.server --model-dir /path/to/models --max-model-memory 48GB --pin llama-3b,qwen-7b
+    python -m omlx.server --model-dir /path/to/models --pin llama-3b,qwen-7b
 
     # With MCP tools
-    python -m omlx.server --model-dir /path/to/models --max-model-memory 32GB --mcp-config mcp.json
+    python -m omlx.server --model-dir /path/to/models --mcp-config mcp.json
 
 Note: Use the omlx CLI for full feature support.
         """,
@@ -4766,12 +4775,6 @@ Note: Use the omlx CLI for full feature support.
         type=str,
         required=True,
         help="Directory containing model subdirectories",
-    )
-    parser.add_argument(
-        "--max-model-memory",
-        type=str,
-        default="32GB",
-        help="Maximum memory for loaded models (e.g., 32GB). KV cache uses additional memory.",
     )
     parser.add_argument(
         "--pin",
@@ -4822,7 +4825,6 @@ Note: Use the omlx CLI for full feature support.
     # Initialize server
     init_server(
         model_dir=args.model_dir,
-        max_model_memory=parse_size(args.max_model_memory),
         pinned_models=pinned_models,
         default_model=args.default_model,
         max_tokens=args.max_tokens,

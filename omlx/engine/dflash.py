@@ -24,6 +24,7 @@ import mlx.core as mx
 from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..utils.model_loading import maybe_apply_pre_load_patches
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,7 @@ class DFlashEngine(BaseEngine):
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
+        self._fallback_lock = asyncio.Lock()
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
         # Protocol-specific output parser factory (gemma4 / harmony).
@@ -142,6 +144,11 @@ class DFlashEngine(BaseEngine):
             bool(getattr(model_settings, "dflash_ssd_cache", False))
             if model_settings
             else False
+        )
+        self._ssd_cache_max_bytes = int(
+            getattr(model_settings, "dflash_ssd_cache_max_bytes", 20 * 1024**3)
+            if model_settings
+            else 20 * 1024**3
         )
         # None → let dflash-mlx pick its own default (window=1024, sink=64, verify="adaptive").
         # `getattr` returns None for missing attrs so older settings files keep working.
@@ -219,9 +226,10 @@ class DFlashEngine(BaseEngine):
             prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
             prefix_cache_l2=l2_enabled,
             prefix_cache_l2_dir=str(l2_dir) if l2_dir else "",
-            # 1 TiB sentinel — disk usage is bounded by the omlx SSD cache
-            # configuration, so dflash's own byte limit is intentionally large.
-            prefix_cache_l2_max_bytes=1 << 40 if l2_enabled else 0,
+            # Per-model L2 disk budget. dflash-mlx's _evict_to_budget drops the
+            # oldest snapshots once dflash_l2/ exceeds this, so the directory
+            # stays bounded instead of filling the disk (issue #1326).
+            prefix_cache_l2_max_bytes=self._ssd_cache_max_bytes if l2_enabled else 0,
             # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values.
             draft_window_size=self._draft_window_size,
             draft_sink_size=self._draft_sink_size,
@@ -243,6 +251,24 @@ class DFlashEngine(BaseEngine):
                 load_draft_bundle,
                 load_target_bundle,
             )
+
+            # Apply the same pre-load patches BatchedEngine uses before
+            # mlx_lm.load() runs. MTP-bearing targets (e.g. Qwen3.6 *-mtp)
+            # need the MTP-compat sanitize patch or stock mlx-lm double-shifts
+            # the already-converted norm and emits garbage. dflash and mtp are
+            # mutually exclusive per model_settings, so this never attaches an
+            # MTP head; it only fixes sanitize. See issue #1318.
+            maybe_apply_pre_load_patches(
+                self._model_name, model_settings=self._model_settings
+            )
+
+            # Wrap dflash's hook installers so we can revert the class-level
+            # __call__ patches when this engine stops. Without this, a later
+            # Native MTP load on the same process would see leftover dflash
+            # hooks and crash with TypeError on n_confirmed (issue #1388).
+            # Idempotent — only wraps once per process.
+            from ..patches.dflash_lifecycle import install_dflash_lifecycle_wrap
+            install_dflash_lifecycle_wrap()
 
             target_bundle = load_target_bundle(self._model_name)
             draft, draft_meta = load_draft_bundle(
@@ -328,6 +354,14 @@ class DFlashEngine(BaseEngine):
         self._draft_backend = None
         self._executor_tokenizer = None
         self._output_parser_factory = None
+        # The fallback engine (BatchedEngine / VLMBatchedEngine) starts next.
+        # Revert dflash's class patches now so the fallback's model loads
+        # onto clean linear_attn / self_attn classes (issue #1388).
+        try:
+            from ..patches.dflash_lifecycle import restore_dflash_class_patches
+            restore_dflash_class_patches()
+        except Exception as exc:
+            logger.debug(f"restore_dflash_class_patches (evict): {exc}")
 
         # Force memory reclaim with settle barrier
         gc.collect()
@@ -397,6 +431,14 @@ class DFlashEngine(BaseEngine):
         self._output_parser_factory = None
         self._in_fallback_mode = False
         self._loaded = False
+        # Revert class-level __call__ patches dflash installed during start().
+        # Required so a subsequent Native MTP load on the same process sees
+        # clean classes instead of leftover dflash hooks (issue #1388).
+        try:
+            from ..patches.dflash_lifecycle import restore_dflash_class_patches
+            restore_dflash_class_patches()
+        except Exception as exc:
+            logger.debug(f"restore_dflash_class_patches: {exc}")
         logger.info("DFlashEngine stopped")
 
     def _apply_chat_template(
@@ -479,6 +521,22 @@ class DFlashEngine(BaseEngine):
             is_partial=is_partial,
         )
         return len(self._tokenizer_obj.encode(prompt))
+
+    @property
+    def supports_multimodal_fallback(self) -> bool:
+        return self._fallback_engine_type == "vlm"
+
+    _MULTIMODAL_TYPES = frozenset({"image", "image_url", "input_image"})
+
+    @staticmethod
+    def _has_multimodal_content(messages: list[dict]) -> bool:
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in DFlashEngine._MULTIMODAL_TYPES:
+                        return True
+        return False
 
     def _should_fallback(self, prompt_tokens: list[int]) -> bool:
         if self._max_dflash_ctx is None:
@@ -747,12 +805,13 @@ class DFlashEngine(BaseEngine):
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
-            if not self._in_fallback_mode:
-                logger.info(
-                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
-                )
-                await self._evict_dflash_and_start_fallback()
+            async with self._fallback_lock:
+                if not self._in_fallback_mode:
+                    logger.info(
+                        f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
+                        f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                    )
+                    await self._evict_dflash_and_start_fallback()
             return await self._fallback_engine.generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
@@ -898,12 +957,13 @@ class DFlashEngine(BaseEngine):
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
-            if not self._in_fallback_mode:
-                logger.info(
-                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
-                )
-                await self._evict_dflash_and_start_fallback()
+            async with self._fallback_lock:
+                if not self._in_fallback_mode:
+                    logger.info(
+                        f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
+                        f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                    )
+                    await self._evict_dflash_and_start_fallback()
             async for output in self._fallback_engine.stream_generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
@@ -1024,6 +1084,29 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        if self._in_fallback_mode:
+            return await self._fallback_engine.chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            )
+
+        if self._fallback_engine_type == "vlm" and self._has_multimodal_content(messages):
+            async with self._fallback_lock:
+                if not self._in_fallback_mode:
+                    logger.info(
+                        "DFlash multimodal fallback: image content detected, "
+                        "switching to VLM engine"
+                    )
+                    await self._evict_dflash_and_start_fallback()
+            return await self._fallback_engine.chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            )
+
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         is_partial = kwargs.pop("is_partial", None)
@@ -1054,6 +1137,33 @@ class DFlashEngine(BaseEngine):
     ) -> AsyncIterator[GenerationOutput]:
         if not self._loaded:
             await self.start()
+
+        if self._in_fallback_mode:
+            async for output in self._fallback_engine.stream_chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            ):
+                yield output
+            return
+
+        if self._fallback_engine_type == "vlm" and self._has_multimodal_content(messages):
+            async with self._fallback_lock:
+                if not self._in_fallback_mode:
+                    logger.info(
+                        "DFlash multimodal fallback: image content detected, "
+                        "switching to VLM engine"
+                    )
+                    await self._evict_dflash_and_start_fallback()
+            async for output in self._fallback_engine.stream_chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            ):
+                yield output
+            return
 
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
