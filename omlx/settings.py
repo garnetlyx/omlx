@@ -307,6 +307,9 @@ class MemorySettings:
     # aborted via the same cleanup path the hard-limit RuntimeError uses.
     prefill_safe_zone_ratio: float = 0.80
     prefill_min_chunk_tokens: int = 32
+    # Opt-in: subtract DS4 sidecar phys_footprint from the reclaimable
+    # active pool in the dynamic ceiling. False = no DS4 lookup, no DS4 logs.
+    ds4_aware: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -318,6 +321,7 @@ class MemorySettings:
             "hard_threshold": self.hard_threshold,
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
+            "ds4_aware": self.ds4_aware,
         }
 
     @classmethod
@@ -340,6 +344,7 @@ class MemorySettings:
             prefill_min_chunk_tokens=int(
                 data.get("prefill_min_chunk_tokens", 32)
             ),
+            ds4_aware=bool(data.get("ds4_aware", False)),
         )
 
 

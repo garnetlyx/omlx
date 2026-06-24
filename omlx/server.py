@@ -347,6 +347,7 @@ async def lifespan(app: FastAPI):
             hard_threshold=memory_settings.hard_threshold,
             prefill_safe_zone_ratio=memory_settings.prefill_safe_zone_ratio,
             prefill_min_chunk_tokens=memory_settings.prefill_min_chunk_tokens,
+            ds4_aware=memory_settings.ds4_aware,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer

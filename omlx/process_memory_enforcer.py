@@ -78,6 +78,52 @@ def _format_gb(b: int) -> str:
     return f"{b / 1024**3:.1f}GB"
 
 
+_DS4_SIDECAR_PORT = 8001
+_DS4_FOOTPRINT_LOG_DELTA_BYTES = 2 * 1024**3
+_DS4_CEILING_WARN_RATIO = 0.60
+
+
+def find_ds4_pid(port: int = _DS4_SIDECAR_PORT) -> int | None:
+    """Discover the DS4 sidecar listener PID via lsof, rediscovered each call.
+
+    Returns None when DS4 is not listening or lsof is unavailable. Never
+    raises so a missing/stopped DS4 cannot disturb the enforcer poll loop.
+    """
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/lsof", "-tiTCP:" + str(port), "-sTCP:LISTEN", "-n", "-P"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    line = out.stdout.strip().split("\n")[0].strip() if out.stdout else ""
+    if not line:
+        return None
+    try:
+        return int(line)
+    except ValueError:
+        return None
+
+
+def get_ds4_footprint_bytes(port: int = _DS4_SIDECAR_PORT) -> int:
+    """phys_footprint of the DS4 sidecar in bytes, 0 when DS4 is absent.
+
+    Rediscovers the PID every call (no stale cache) and reads the kernel
+    phys_footprint ledger, which includes Metal-wired allocations on Apple
+    Silicon. Returns 0 if DS4 is stopped or the PID vanishes mid-read so the
+    caller treats a disappearing DS4 as zero footprint.
+    """
+    pid = find_ds4_pid(port)
+    if pid is None:
+        return 0
+    try:
+        return max(0, get_phys_footprint(pid))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 class _VMStats64(ctypes.Structure):
     """Layout of mach `vm_statistics64`. Field order + types must match
     `<mach/vm_statistics.h>` so ctypes reads them at the right offsets.
@@ -291,6 +337,7 @@ class ProcessMemoryEnforcer:
         hard_threshold: float = 0.95,
         prefill_safe_zone_ratio: float = 0.80,
         prefill_min_chunk_tokens: int = 32,
+        ds4_aware: bool = False,
     ):
         """
         Initialize the process memory enforcer.
@@ -317,6 +364,9 @@ class ProcessMemoryEnforcer:
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
                 runs at full chunk size; above triggers adaptive shrink.
             prefill_min_chunk_tokens: Floor for adaptive shrink.
+            ds4_aware: When True, subtract the DS4 sidecar's phys_footprint
+                from the reclaimable active pool in the dynamic ceiling.
+                Default False does no DS4 lookup and emits no DS4 logs.
         """
         self._engine_pool = engine_pool
         self._memory_guard_tier = self._normalize_tier(memory_guard_tier)
@@ -331,6 +381,9 @@ class ProcessMemoryEnforcer:
         self._hard_threshold = hard_threshold
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
+        self._ds4_aware = bool(ds4_aware)
+        self._ds4_footprint_bytes: int = 0
+        self._last_ds4_footprint_bytes: int = 0
         self._task: asyncio.Task | None = None
         self._running = False
         # Most recently observed pressure level, consumed by scheduler /
@@ -468,12 +521,46 @@ class ProcessMemoryEnforcer:
         if stats is None:
             return max(0, omlx_usage + psutil.virtual_memory().available)
         ratio = _ACTIVE_RECLAIM_RATIO[self._memory_guard_tier]
+        active_reclaimable = max(0, stats["active"] - self._ds4_footprint_bytes)
         reclaimable = (
             stats["free"]
             + stats["inactive"]
-            + int(stats["active"] * ratio)
+            + int(active_reclaimable * ratio)
         )
         return max(0, omlx_usage + reclaimable)
+
+    def _refresh_ds4_footprint(self) -> None:
+        """Refresh the cached DS4 footprint once per poll and log changes.
+
+        No-op when ds4_aware is disabled, leaving the cached footprint at 0
+        so the dynamic ceiling math is unchanged. Rediscovers the DS4 PID
+        each call (no stale PID) and treats a stopped/vanished DS4 as zero.
+        Logs an info line on >2 GB moves and a warning when DS4 exceeds 60%
+        of the static ceiling. omlx never signals or evicts DS4.
+        """
+        if not self._ds4_aware:
+            return
+        footprint = get_ds4_footprint_bytes()
+        self._ds4_footprint_bytes = footprint
+        if abs(footprint - self._last_ds4_footprint_bytes) > _DS4_FOOTPRINT_LOG_DELTA_BYTES:
+            logger.info(
+                "DS4 memory footprint changed: %s -> %s",
+                _format_gb(self._last_ds4_footprint_bytes),
+                _format_gb(footprint),
+            )
+            self._last_ds4_footprint_bytes = footprint
+        static_ceiling = self._get_static_ceiling()
+        if (
+            footprint > 0
+            and static_ceiling > 0
+            and footprint > static_ceiling * _DS4_CEILING_WARN_RATIO
+        ):
+            logger.warning(
+                "DS4 footprint (%s) exceeds %d%% of the oMLX static ceiling (%s)",
+                _format_gb(footprint),
+                int(_DS4_CEILING_WARN_RATIO * 100),
+                _format_gb(static_ceiling),
+            )
 
     def _get_hard_limit_bytes(self) -> int:
         """Final hard ceiling = min(static, dynamic, metal_cap).
@@ -663,6 +750,7 @@ class ProcessMemoryEnforcer:
         """
         # Always propagate so the scheduler sees the latest ceiling /
         # admission_paused, even when usage stays below the soft mark.
+        self._refresh_ds4_footprint()
         self._propagate_memory_limit()
 
         ceiling = self._get_hard_limit_bytes()
