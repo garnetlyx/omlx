@@ -1832,7 +1832,18 @@
             const resp = await fetch('/admin/api/sidecar-config', { credentials: 'same-origin' });
             if (!resp.ok) return;
             const data = await resp.json();
-            this.sidecarConfig.baseUrl = data.base_url || '';
+            // Server provides a loopback base_url (http://127.0.0.1:4000/v1) that
+            // works when the browser is on the same host. When this page is served
+            // over HTTPS (e.g. via a reverse proxy such as Tailscale Serve), the
+            // browser is remote: a hard-coded 127.0.0.1 target is unreachable AND
+            // an http:// target from an https:// page is mixed-content blocked.
+            // Derive a same-origin-protocol target so the remote browser reaches
+            // Sub2API through the same proxy host it loaded this page from.
+            const serverBaseUrl = (data.base_url || '').replace(/\/+$/, '');
+            const lo = window.location;
+            this.sidecarConfig.baseUrl = lo.protocol === 'https:'
+                ? `${lo.protocol}//${lo.hostname}:8443/v1`
+                : (serverBaseUrl || `http://${lo.hostname}:4000/v1`);
             this.sidecarConfig.apiKey = data.api_key || '';
             this.sidecarConfig.models = Array.isArray(data.models) ? data.models : [];
             this.sidecarModelIds = {};
