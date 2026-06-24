@@ -658,6 +658,35 @@ class IntegrationSettings:
         )
 
 
+# base_url points at the Sub2API gateway (:4000), never omlx (:8000) or the
+# DS4 sidecar (:8001): the gateway keeps ownership of public routing.
+DEFAULT_DS4_SUB2API_BASE_URL = "http://127.0.0.1:4000/v1"
+
+
+@dataclass
+class SidecarSettings:
+    """Observability/config for external sidecar processes (e.g. DS4).
+
+    omlx does not run or route these sidecars; it only reports their health
+    on the admin dashboard and hands a trusted frontend the gateway details
+    it needs to chat with them directly.
+    """
+
+    ds4_sub2api_base_url: str = DEFAULT_DS4_SUB2API_BASE_URL
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "ds4_sub2api_base_url": self.ds4_sub2api_base_url,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SidecarSettings:
+        """Create from dictionary."""
+        base_url = data.get("ds4_sub2api_base_url") or DEFAULT_DS4_SUB2API_BASE_URL
+        return cls(ds4_sub2api_base_url=str(base_url))
+
+
 @dataclass
 class GlobalSettings:
     """
@@ -687,6 +716,7 @@ class GlobalSettings:
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
     idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
+    sidecar: SidecarSettings = field(default_factory=SidecarSettings)
 
     @classmethod
     def load(
@@ -782,6 +812,8 @@ class GlobalSettings:
                 self.ui = UISettings.from_dict(data["ui"])
             if "idle_timeout" in data:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(data["idle_timeout"])
+            if "sidecar" in data:
+                self.sidecar = SidecarSettings.from_dict(data["sidecar"])
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -961,6 +993,7 @@ class GlobalSettings:
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
+            "sidecar": self.sidecar.to_dict(),
         }
 
         try:
@@ -1201,6 +1234,7 @@ class GlobalSettings:
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
+            "sidecar": self.sidecar.to_dict(),
         }
 
 

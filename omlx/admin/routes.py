@@ -33,7 +33,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..settings import SubKeyEntry
+from ..settings import DEFAULT_DS4_SUB2API_BASE_URL, SubKeyEntry
 from ..utils.release_check import select_latest_stable_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -274,6 +274,9 @@ class GlobalSettingsRequest(BaseModel):
 
     # UI settings
     ui_language: str | None = None
+
+    # Sidecar settings (DS4 dashboard observability + chat config)
+    ds4_sub2api_base_url: str | None = None
 
     # Idle timeout settings. null disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
@@ -2810,6 +2813,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
         },
+        "sidecar": {
+            "ds4_sub2api_base_url": global_settings.sidecar.ds4_sub2api_base_url,
+        },
     }
 
 
@@ -3232,6 +3238,16 @@ async def update_global_settings(
             logger.info(f"Idle timeout set to: {request.idle_timeout_seconds}s")
         else:
             logger.info("Idle timeout disabled")
+
+    if "ds4_sub2api_base_url" in request.model_fields_set:
+        base_url = (request.ds4_sub2api_base_url or "").strip()
+        global_settings.sidecar.ds4_sub2api_base_url = (
+            base_url or DEFAULT_DS4_SUB2API_BASE_URL
+        )
+        runtime_applied.append("ds4_sub2api_base_url")
+        logger.info(
+            f"Sidecar DS4 base URL set to: {global_settings.sidecar.ds4_sub2api_base_url}"
+        )
 
     # Apply auth settings (API key change)
     if request.api_key is not None:
@@ -3739,6 +3755,181 @@ def _build_runtime_cache_observability(
     return payload
 
 
+# =============================================================================
+# DS4 Sidecar Observability
+# =============================================================================
+#
+# omlx observes the DS4 sidecar (a separate Metal process on :8001) for the
+# admin dashboard only. It never routes, proxies, or schedules DS4 traffic and
+# keeps DS4 out of EnginePool / ServerMetrics. The dashboard polls /api/stats
+# every ~500ms, so the fetch is cached and every call is exception-safe: a
+# down/slow DS4 must degrade to a status dict, never 500 the stats endpoint.
+
+_DS4_SIDECAR_PORT = 8001
+_DS4_SIDECAR_TTL = 3.0
+_ds4_sidecar_cache: dict[str, Any] | None = None
+_ds4_sidecar_cache_time: float = 0.0
+_ds4_sidecar_lock = asyncio.Lock()
+
+
+def _ds4_discover_pid() -> int | None:
+    try:
+        result = subprocess.run(
+            [
+                "/usr/sbin/lsof",
+                f"-tiTCP:{_DS4_SIDECAR_PORT}",
+                "-sTCP:LISTEN",
+                "-n",
+                "-P",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    lines = (result.stdout or "").strip().splitlines()
+    if not lines:
+        return None
+    try:
+        return int(lines[0].strip())
+    except ValueError:
+        return None
+
+
+def _ds4_process_memory(pid: int) -> tuple[float | None, float | None]:
+    from ..utils.proc_memory import get_phys_footprint
+
+    footprint_gb: float | None = None
+    try:
+        footprint_bytes = get_phys_footprint(pid)
+        if footprint_bytes > 0:
+            footprint_gb = footprint_bytes / 1024**3
+    except Exception:
+        footprint_gb = None
+
+    rss_gb: float | None = None
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        rss_kb = (result.stdout or "").strip()
+        if rss_kb:
+            rss_gb = (int(rss_kb) * 1024) / 1024**3
+    except (subprocess.SubprocessError, OSError, ValueError):
+        rss_gb = None
+
+    return rss_gb, footprint_gb
+
+
+def _ds4_pressure_level() -> int | None:
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        value = (result.stdout or "").strip()
+        return int(value) if value else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def _ds4_stopped(last_error: str | None = None) -> dict[str, Any]:
+    return {
+        "status": "error" if last_error else "stopped",
+        "running": False,
+        "pid": None,
+        "model": None,
+        "models": [],
+        "port": _DS4_SIDECAR_PORT,
+        "rss_gb": None,
+        "footprint_gb": None,
+        "pressure_level": None,
+        "ceiling_gb": None,
+        "headroom_gb": None,
+        "kv_disk_gb": None,
+        "last_error": last_error,
+    }
+
+
+def _fetch_ds4_sidecar_stats_blocking() -> dict[str, Any]:
+    try:
+        pid = _ds4_discover_pid()
+        if pid is None:
+            return _ds4_stopped()
+
+        models: list[str] = []
+        last_error: str | None = None
+        try:
+            resp = requests.get(
+                f"http://127.0.0.1:{_DS4_SIDECAR_PORT}/v1/models",
+                timeout=1.5,
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data", [])
+                models = [
+                    m["id"] for m in data if isinstance(m, dict) and m.get("id")
+                ]
+            else:
+                last_error = f"DS4 /v1/models returned {resp.status_code}"
+        except Exception as exc:
+            last_error = f"DS4 /v1/models unreachable: {exc}"
+
+        rss_gb, footprint_gb = _ds4_process_memory(pid)
+        return {
+            "status": "running",
+            "running": True,
+            "pid": pid,
+            "model": models[0] if models else None,
+            "models": models,
+            "port": _DS4_SIDECAR_PORT,
+            "rss_gb": rss_gb,
+            "footprint_gb": footprint_gb,
+            "pressure_level": _ds4_pressure_level(),
+            "ceiling_gb": None,
+            "headroom_gb": None,
+            "kv_disk_gb": None,
+            "last_error": last_error,
+        }
+    except Exception as exc:
+        logger.debug("DS4 sidecar fetch failed: %s", exc)
+        return _ds4_stopped(last_error=str(exc))
+
+
+async def _fetch_ds4_sidecar_stats() -> dict[str, Any]:
+    global _ds4_sidecar_cache, _ds4_sidecar_cache_time
+
+    now = time.time()
+    if (
+        _ds4_sidecar_cache is not None
+        and now - _ds4_sidecar_cache_time < _DS4_SIDECAR_TTL
+    ):
+        return _ds4_sidecar_cache
+
+    if _ds4_sidecar_lock.locked():
+        return _ds4_sidecar_cache if _ds4_sidecar_cache is not None else _ds4_stopped()
+
+    async with _ds4_sidecar_lock:
+        now = time.time()
+        if (
+            _ds4_sidecar_cache is not None
+            and now - _ds4_sidecar_cache_time < _DS4_SIDECAR_TTL
+        ):
+            return _ds4_sidecar_cache
+        try:
+            result = await asyncio.to_thread(_fetch_ds4_sidecar_stats_blocking)
+        except Exception as exc:
+            result = _ds4_stopped(last_error=str(exc))
+        _ds4_sidecar_cache = result
+        _ds4_sidecar_cache_time = time.time()
+        return result
+
+
 @router.get("/api/stats")
 async def get_server_stats(
     model: str = "",
@@ -3791,6 +3982,29 @@ async def get_server_stats(
         "engines": _get_engine_info(),
         "active_models": active_models_data,
         "runtime_cache": runtime_cache_data,
+        "sidecars": {"ds4": await _fetch_ds4_sidecar_stats()},
+    }
+
+
+@router.get("/api/sidecar-config")
+async def get_sidecar_config(is_admin: bool = Depends(require_admin)):
+    """Gateway details for the trusted admin frontend's sidecar chat.
+
+    The frontend chats with the sidecar through Sub2API directly; omlx never
+    proxies sidecar traffic. The model list comes from live DS4 discovery.
+    """
+    global_settings = _get_global_settings()
+    base_url = (
+        global_settings.sidecar.ds4_sub2api_base_url
+        if global_settings
+        else DEFAULT_DS4_SUB2API_BASE_URL
+    )
+    api_key = global_settings.auth.api_key if global_settings else ""
+    sidecar_stats = await _fetch_ds4_sidecar_stats()
+    return {
+        "base_url": base_url,
+        "api_key": api_key or "",
+        "models": sidecar_stats.get("models") or [],
     }
 
 
