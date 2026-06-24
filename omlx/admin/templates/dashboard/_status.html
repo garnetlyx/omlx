@@ -451,6 +451,90 @@
                         </div>
                     </div>
 
+                    <!-- DS4 Sidecar (read-only) -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="server" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.sidecar.section_label') }}</span>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <span class="relative flex h-2 w-2">
+                                    <span x-show="stats.sidecars?.ds4?.running"
+                                          class="absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75 animate-ping"></span>
+                                    <span class="relative inline-flex rounded-full h-2 w-2"
+                                          :class="stats.sidecars?.ds4?.running ? 'bg-green-500' : (stats.sidecars?.ds4?.status === 'error' ? 'bg-red-500' : 'bg-neutral-400')"></span>
+                                </span>
+                                <span class="text-xs font-medium"
+                                      :class="stats.sidecars?.ds4?.running ? 'text-green-600' : (stats.sidecars?.ds4?.status === 'error' ? 'text-red-600' : 'text-neutral-500')"
+                                      x-text="stats.sidecars?.ds4?.running ? window.t('status.sidecar.running') : (stats.sidecars?.ds4?.status === 'loading' ? window.t('status.sidecar.loading') : (stats.sidecars?.ds4?.status === 'error' ? window.t('status.sidecar.error') : window.t('status.sidecar.stopped')))"></span>
+                            </div>
+                        </div>
+                        <div class="px-6 py-4 space-y-4">
+                            <!-- Stopped / error notice -->
+                            <div x-show="!stats.sidecars?.ds4?.running" x-cloak
+                                 class="flex items-center gap-2 px-3 py-2.5 bg-neutral-50 border border-neutral-200 rounded-lg text-xs text-neutral-500">
+                                <i data-lucide="power-off" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                                <span x-show="stats.sidecars?.ds4?.status !== 'error'">{{ t('status.sidecar.offline_hint') }}</span>
+                                <span x-show="stats.sidecars?.ds4?.status === 'error'" class="text-red-600"
+                                      x-text="window.t('status.sidecar.error') + ': ' + (stats.sidecars?.ds4?.last_error || '')"></span>
+                            </div>
+
+                            <!-- Memory gauge (running, ceiling known) -->
+                            <div x-show="stats.sidecars?.ds4?.running" x-cloak class="space-y-1.5">
+                                <div class="flex items-center justify-between text-xs">
+                                    <span class="text-neutral-400">{{ t('status.sidecar.memory') }}</span>
+                                    <div class="flex items-center gap-2">
+                                        <span class="w-1.5 h-1.5 rounded-full" :class="ds4PressureColor(stats.sidecars?.ds4?.pressure_level)"></span>
+                                        <span class="text-neutral-500" x-text="ds4PressureLabel(stats.sidecars?.ds4?.pressure_level)"></span>
+                                    </div>
+                                </div>
+                                <div x-show="stats.sidecars?.ds4?.ceiling_gb" class="w-full h-2 rounded-full overflow-hidden gauge-track">
+                                    <div class="h-full rounded-full transition-all duration-500"
+                                         :class="ds4PressureColor(stats.sidecars?.ds4?.pressure_level)"
+                                         :style="'width: ' + ds4FootprintPercent + '%'"></div>
+                                </div>
+                                <div class="flex items-center justify-between text-xs text-neutral-500">
+                                    <span x-text="formatGb(stats.sidecars?.ds4?.footprint_gb) + (stats.sidecars?.ds4?.ceiling_gb ? (' / ' + formatGb(stats.sidecars?.ds4?.ceiling_gb)) : '')"></span>
+                                    <span x-show="stats.sidecars?.ds4?.headroom_gb != null"
+                                          x-text="window.t('status.sidecar.headroom') + ': ' + formatGb(stats.sidecars?.ds4?.headroom_gb)"></span>
+                                </div>
+                            </div>
+
+                            <!-- Detail grid -->
+                            <div x-show="stats.sidecars?.ds4?.running" x-cloak
+                                 class="grid grid-cols-2 sm:grid-cols-3 gap-3 text-xs">
+                                <div>
+                                    <div class="text-neutral-400 mb-0.5">{{ t('status.sidecar.model') }}</div>
+                                    <div class="font-medium text-neutral-800 break-all" x-text="stats.sidecars?.ds4?.model || '—'"></div>
+                                </div>
+                                <div>
+                                    <div class="text-neutral-400 mb-0.5">{{ t('status.sidecar.pid_port') }}</div>
+                                    <div class="font-medium text-neutral-800" x-text="(stats.sidecars?.ds4?.pid ?? '—') + ' : ' + (stats.sidecars?.ds4?.port ?? '—')"></div>
+                                </div>
+                                <div>
+                                    <div class="text-neutral-400 mb-0.5">{{ t('status.sidecar.rss') }}</div>
+                                    <div class="font-medium text-neutral-800" x-text="formatGb(stats.sidecars?.ds4?.rss_gb)"></div>
+                                </div>
+                                <div>
+                                    <div class="text-neutral-400 mb-0.5">{{ t('status.sidecar.ceiling') }}</div>
+                                    <div class="font-medium text-neutral-800" x-text="formatGb(stats.sidecars?.ds4?.ceiling_gb)"></div>
+                                </div>
+                                <div>
+                                    <div class="text-neutral-400 mb-0.5">{{ t('status.sidecar.kv_disk') }}</div>
+                                    <div class="font-medium text-neutral-800" x-text="formatGb(stats.sidecars?.ds4?.kv_disk_gb)"></div>
+                                </div>
+                                <div>
+                                    <div class="text-neutral-400 mb-0.5">{{ t('status.sidecar.last_oom') }}</div>
+                                    <div class="font-medium text-neutral-800" x-text="stats.sidecars?.ds4?.last_oom || window.t('status.sidecar.last_oom_none')"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- DS4 Sidecar Chat -->
+                    {% include "dashboard/_sidecar_chat.html" %}
+
                     <!-- API Endpoints -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
