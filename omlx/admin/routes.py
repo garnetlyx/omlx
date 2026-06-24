@@ -3771,6 +3771,42 @@ _ds4_sidecar_cache: dict[str, Any] | None = None
 _ds4_sidecar_cache_time: float = 0.0
 _ds4_sidecar_lock = asyncio.Lock()
 
+# DS4's native /v1/models IDs (deepseek-v4-flash/-pro) collide with the remote
+# DeepSeek provider catalog, so they are NOT valid sidecar chat models: calling
+# them through Sub2API can schedule to a remote account. The local quantized
+# GGUF is published by Sub2API under this derived public alias. The dashboard
+# chat MUST target this alias, never the bare internal ID.
+_DS4_PUBLIC_CHAT_ALIAS = "Deepseek-V4-Flash-q2-imatrix"
+_ds4_public_models_cache: list[str] | None = None
+_ds4_public_models_cache_time: float = 0.0
+_ds4_public_models_lock = asyncio.Lock()
+
+
+def _ds4_ctx() -> int | None:
+    try:
+        return int(os.getenv("DS4_CTX", "393216"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _ds4_kv_disk_gb() -> float | None:
+    kv_dir = os.getenv("DS4_KV_DIR")
+    if not kv_dir:
+        return None
+    try:
+        total = 0
+        for root, _dirs, files in os.walk(kv_dir):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+        return total / 1024**3
+    except OSError:
+        return None
+
+
+
 
 def _ds4_discover_pid() -> int | None:
     try:
@@ -3847,6 +3883,7 @@ def _ds4_stopped(last_error: str | None = None) -> dict[str, Any]:
         "model": None,
         "models": [],
         "port": _DS4_SIDECAR_PORT,
+        "ctx": _ds4_ctx(),
         "rss_gb": None,
         "footprint_gb": None,
         "pressure_level": None,
@@ -3888,12 +3925,13 @@ def _fetch_ds4_sidecar_stats_blocking() -> dict[str, Any]:
             "model": models[0] if models else None,
             "models": models,
             "port": _DS4_SIDECAR_PORT,
+            "ctx": _ds4_ctx(),
             "rss_gb": rss_gb,
             "footprint_gb": footprint_gb,
             "pressure_level": _ds4_pressure_level(),
             "ceiling_gb": None,
             "headroom_gb": None,
-            "kv_disk_gb": None,
+            "kv_disk_gb": _ds4_kv_disk_gb(),
             "last_error": last_error,
         }
     except Exception as exc:
@@ -3927,6 +3965,67 @@ async def _fetch_ds4_sidecar_stats() -> dict[str, Any]:
             result = _ds4_stopped(last_error=str(exc))
         _ds4_sidecar_cache = result
         _ds4_sidecar_cache_time = time.time()
+        return result
+
+
+def _fetch_ds4_public_chat_models_blocking(base_url: str, api_key: str) -> list[str]:
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        resp = requests.get(
+            f"{base_url.rstrip('/')}/models",
+            headers=headers,
+            timeout=1.5,
+        )
+        if resp.status_code == 200:
+            ids = {
+                m["id"]
+                for m in resp.json().get("data", [])
+                if isinstance(m, dict) and m.get("id")
+            }
+            if _DS4_PUBLIC_CHAT_ALIAS not in ids:
+                logger.warning(
+                    "Sub2API catalog missing DS4 public alias %s; "
+                    "returning it as conservative fallback",
+                    _DS4_PUBLIC_CHAT_ALIAS,
+                )
+        else:
+            logger.debug("Sub2API /models returned %s", resp.status_code)
+    except Exception as exc:
+        logger.debug("Sub2API catalog lookup failed: %s", exc)
+    return [_DS4_PUBLIC_CHAT_ALIAS]
+
+
+async def _resolve_ds4_public_chat_models(base_url: str, api_key: str) -> list[str]:
+    global _ds4_public_models_cache, _ds4_public_models_cache_time
+
+    now = time.time()
+    if (
+        _ds4_public_models_cache is not None
+        and now - _ds4_public_models_cache_time < _DS4_SIDECAR_TTL
+    ):
+        return _ds4_public_models_cache
+
+    if _ds4_public_models_lock.locked():
+        if _ds4_public_models_cache is not None:
+            return _ds4_public_models_cache
+        return [_DS4_PUBLIC_CHAT_ALIAS]
+
+    async with _ds4_public_models_lock:
+        now = time.time()
+        if (
+            _ds4_public_models_cache is not None
+            and now - _ds4_public_models_cache_time < _DS4_SIDECAR_TTL
+        ):
+            return _ds4_public_models_cache
+        try:
+            result = await asyncio.to_thread(
+                _fetch_ds4_public_chat_models_blocking, base_url, api_key
+            )
+        except Exception as exc:
+            logger.debug("Sub2API catalog resolve failed: %s", exc)
+            result = [_DS4_PUBLIC_CHAT_ALIAS]
+        _ds4_public_models_cache = result
+        _ds4_public_models_cache_time = time.time()
         return result
 
 
@@ -3991,7 +4090,8 @@ async def get_sidecar_config(is_admin: bool = Depends(require_admin)):
     """Gateway details for the trusted admin frontend's sidecar chat.
 
     The frontend chats with the sidecar through Sub2API directly; omlx never
-    proxies sidecar traffic. The model list comes from live DS4 discovery.
+    proxies sidecar traffic. Models are Sub2API public aliases (resolved from
+    the live gateway catalog), NOT DS4's internal upstream IDs.
     """
     global_settings = _get_global_settings()
     base_url = (
@@ -4000,11 +4100,11 @@ async def get_sidecar_config(is_admin: bool = Depends(require_admin)):
         else DEFAULT_DS4_SUB2API_BASE_URL
     )
     api_key = global_settings.auth.api_key if global_settings else ""
-    sidecar_stats = await _fetch_ds4_sidecar_stats()
+    models = await _resolve_ds4_public_chat_models(base_url, api_key or "")
     return {
         "base_url": base_url,
         "api_key": api_key or "",
-        "models": sidecar_stats.get("models") or [],
+        "models": models,
     }
 
 
