@@ -1283,6 +1283,16 @@
             availableModels: [],
             currentModel: null,
 
+            // Sidecar (DS4 via Sub2API) — selectable as a chat model that routes
+            // directly to the Sub2API gateway (non-streaming), not omlx /v1.
+            sidecarConfig: {
+                loaded: false,
+                baseUrl: '',
+                apiKey: '',
+                models: [],
+            },
+            sidecarModelIds: {},   // { modelId: true } lookup for routing
+
             // Streaming State
             streamSessions: {},
 
@@ -1467,7 +1477,6 @@
             this.loadChatHistory();
             this.fetchMcpTools();
         }
-
         this.applyTheme();
 
         this.$nextTick(() => {
@@ -1776,6 +1785,15 @@
                 const t = (this.modelTypeMap[m.id] || '').toLowerCase();
                 return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
             });
+
+            // Merge DS4 sidecar models (routed directly through Sub2API, not omlx).
+            await this.loadSidecarConfig();
+            for (const sm of this.sidecarConfig.models) {
+                if (!this.availableModels.some(m => m.id === sm)) {
+                    this.availableModels.push({ id: sm, _sidecar: true });
+                }
+            }
+
             // Get default model from health endpoint
             let defaultModel = null;
             if (healthResponse.ok) {
@@ -1801,6 +1819,119 @@
         const session = this.getChatSession(this.currentChatId, true);
         if (session) {
             session.model = modelId;
+        }
+    },
+
+    // ===== DS4 Sidecar (Sub2API) =====
+
+    // Load public sidecar chat config (Sub2API base URL, shared key, public
+    // alias list). Never throws; on failure the sidecar models are simply not
+    // added to the selector and normal omlx chat is unaffected.
+    async loadSidecarConfig() {
+        try {
+            const resp = await fetch('/admin/api/sidecar-config', { credentials: 'same-origin' });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            this.sidecarConfig.baseUrl = data.base_url || '';
+            this.sidecarConfig.apiKey = data.api_key || '';
+            this.sidecarConfig.models = Array.isArray(data.models) ? data.models : [];
+            this.sidecarModelIds = {};
+            for (const m of this.sidecarConfig.models) {
+                this.sidecarModelIds[m] = true;
+            }
+            this.sidecarConfig.loaded = true;
+        } catch (e) {
+            // Sidecar config unavailable — omlx chat still works.
+        }
+    },
+
+    isSidecarModel(modelId) {
+        return Boolean(modelId && this.sidecarModelIds[modelId]);
+    },
+
+    // Non-streaming chat against the Sub2API gateway for DS4 sidecar models.
+    // Mirrors the assistant-message lifecycle of streamResponse() but uses a
+    // single direct POST. CORS/network failures degrade to a visible error
+    // assistant message instead of crashing.
+    async sendSidecarResponse(context) {
+        const chatSession = this.getChatSession(context.chatId, true);
+        const stream = this.getStreamSession(context.chatId, true);
+        chatSession.model = context.model;
+        chatSession.systemPrompt = context.systemPrompt;
+
+        this.resetStreamSession(stream);
+        stream._statusStart = Date.now();
+        stream.sourceModel = context.model;
+        stream.sourceSystemPrompt = context.systemPrompt;
+        stream.isStreaming = true;
+        stream.abortController = new AbortController();
+        this.autoScrollEnabled = true;
+        this.setEngineStatus(context.chatId, { text: 'Sending to Sub2API' });
+
+        // Build OpenAI-style messages (text only; sidecar is a text LLM).
+        const messagesForApi = chatSession.messages
+            .filter(msg => ['user', 'assistant', 'system'].includes(msg.role) && msg._ui !== false)
+            .map(msg => ({ role: msg.role, content: this.getTextContent(msg.content) }));
+        if (context.systemPrompt.trim()) {
+            messagesForApi.unshift({ role: 'system', content: context.systemPrompt.trim() });
+        }
+
+        const timeoutSignal = AbortSignal.timeout?.(60000);
+        const signal = stream.abortController?.signal && timeoutSignal
+            ? AbortSignal.any([stream.abortController.signal, timeoutSignal])
+            : (timeoutSignal || stream.abortController?.signal);
+
+        try {
+            if (!this.sidecarConfig.baseUrl) {
+                throw new Error(window.t('chat.error.sidecar_unconfigured') || 'Sidecar not configured');
+            }
+            const resp = await fetch(this.sidecarConfig.baseUrl.replace(/\/+$/, '') + '/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.sidecarConfig.apiKey}`,
+                },
+                body: JSON.stringify({ model: context.model, messages: messagesForApi, stream: false }),
+                signal,
+            });
+            if (!resp.ok) {
+                const detail = (resp.status === 502 || resp.status === 503)
+                    ? (window.t('chat.error.sidecar_upstream') || 'Upstream unavailable (502/503). Is DS4 running?')
+                    : `Error: ${resp.status}`;
+                throw new Error(detail);
+            }
+            const data = await resp.json();
+            const reply = data?.choices?.[0]?.message?.content ?? '';
+            chatSession.messages.push({
+                role: 'assistant',
+                content: reply || '',
+                model: context.model,
+                _perfVisible: false,
+            });
+            this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
+            if (this.currentChatId === context.chatId) this.scheduleEnhanceMessages();
+        } catch (error) {
+            let msg;
+            if (error.name === 'AbortError') {
+                msg = window.t('chat.error.sidecar_timeout') || 'Request timed out';
+            } else if (error.name === 'TimeoutError') {
+                msg = window.t('chat.error.sidecar_timeout') || 'Request timed out after 60s';
+            } else if (error instanceof TypeError) {
+                // fetch() TypeError == network/CORS failure
+                msg = window.t('chat.error.sidecar_network') || 'Network error (check CORS / connectivity)';
+            } else {
+                msg = error.message;
+            }
+            chatSession.messages.push({
+                role: 'assistant',
+                content: `Error: ${msg}`,
+                model: context.model,
+                _perfVisible: false,
+            });
+            this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
+            if (this.currentChatId === context.chatId) this.scheduleEnhanceMessages();
+        } finally {
+            this.resetStreamSession(stream, { preserveFinalContent: true });
         }
     },
 
@@ -2009,6 +2140,13 @@
         context.systemPrompt = context.systemPrompt ?? chatSession?.systemPrompt ?? '';
         chatSession.model = context.model;
         chatSession.systemPrompt = context.systemPrompt;
+
+        // DS4 sidecar models route directly to Sub2API (non-streaming),
+        // bypassing the omlx /v1/chat/completions streaming path entirely.
+        if (this.isSidecarModel(context.model)) {
+            await this.sendSidecarResponse(context);
+            return;
+        }
 
         if (depth > this.MAX_TOOL_DEPTH) {
             chatSession.messages.push({

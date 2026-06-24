@@ -215,20 +215,6 @@
             showClearHotCacheConfirm: false,
             _statsRefreshTimer: null,
 
-            sidecarChat: {
-                configLoaded: false,
-                configLoading: false,
-                configError: '',
-                baseUrl: '',
-                apiKey: '',
-                models: [],
-                selectedModel: '',
-                messages: [],
-                input: '',
-                loading: false,
-                error: '',
-            },
-
             // Log viewer state
             logContent: '',
             logLines: 500,
@@ -557,7 +543,6 @@
                 if (value === 'status') {
                     await this.loadStats();
                     this.startStatsRefresh();
-                    if (!this.sidecarChat.configLoaded) this.loadSidecarConfig();
                 } else {
                     this.stopStatsRefresh();
                 }
@@ -2292,96 +2277,6 @@
                 return Math.min(100, Math.max(0, (ds4.footprint_gb / ds4.ceiling_gb) * 100));
             },
 
-            async loadSidecarConfig() {
-                if (this.sidecarChat.configLoading) return;
-                this.sidecarChat.configLoading = true;
-                this.sidecarChat.configError = '';
-                try {
-                    const resp = await fetch('/admin/api/sidecar-config', { credentials: 'same-origin' });
-                    if (resp.status === 401) {
-                        this.sidecarChat.configError = window.t('status.sidecar_chat.error_auth');
-                        return;
-                    }
-                    if (!resp.ok) {
-                        this.sidecarChat.configError = window.t('status.sidecar_chat.error_config') + ' (' + resp.status + ')';
-                        return;
-                    }
-                    const data = await resp.json();
-                    this.sidecarChat.baseUrl = data.base_url || '';
-                    this.sidecarChat.apiKey = data.api_key || '';
-                    this.sidecarChat.models = Array.isArray(data.models) ? data.models : [];
-                    if (this.sidecarChat.models.length > 0 && !this.sidecarChat.selectedModel) {
-                        this.sidecarChat.selectedModel = this.sidecarChat.models[0];
-                    }
-                    this.sidecarChat.configLoaded = true;
-                } catch (err) {
-                    this.sidecarChat.configError = window.t('status.sidecar_chat.error_config');
-                } finally {
-                    this.sidecarChat.configLoading = false;
-                }
-            },
-
-            async sendSidecarChat() {
-                const text = (this.sidecarChat.input || '').trim();
-                if (!text || this.sidecarChat.loading) return;
-                if (!this.sidecarChat.configLoaded) {
-                    await this.loadSidecarConfig();
-                    if (!this.sidecarChat.configLoaded) return;
-                }
-                const model = this.sidecarChat.selectedModel || (this.sidecarChat.models[0] || '');
-                if (!model || !this.sidecarChat.baseUrl) {
-                    this.sidecarChat.error = window.t('status.sidecar_chat.error_no_model');
-                    return;
-                }
-
-                this.sidecarChat.error = '';
-                this.sidecarChat.messages.push({ role: 'user', content: text });
-                this.sidecarChat.input = '';
-                this.sidecarChat.loading = true;
-
-                const payloadMessages = this.sidecarChat.messages.map(m => ({ role: m.role, content: m.content }));
-                const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), 60000);
-                try {
-                    const resp = await fetch(this.sidecarChat.baseUrl.replace(/\/+$/, '') + '/chat/completions', {
-                        method: 'POST',
-                        headers: {
-                            'Authorization': 'Bearer ' + this.sidecarChat.apiKey,
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({ model, messages: payloadMessages, stream: false }),
-                        signal: controller.signal,
-                    });
-                    if (!resp.ok) {
-                        let detail = resp.status === 401
-                            ? window.t('status.sidecar_chat.error_auth')
-                            : (resp.status === 502 || resp.status === 503)
-                                ? window.t('status.sidecar_chat.error_upstream')
-                                : window.t('status.sidecar_chat.error_request') + ' (' + resp.status + ')';
-                        this.sidecarChat.error = detail;
-                        return;
-                    }
-                    const data = await resp.json();
-                    const reply = data?.choices?.[0]?.message?.content;
-                    if (reply == null) {
-                        this.sidecarChat.error = window.t('status.sidecar_chat.error_empty');
-                        return;
-                    }
-                    this.sidecarChat.messages.push({ role: 'assistant', content: reply });
-                } catch (err) {
-                    this.sidecarChat.error = err.name === 'AbortError'
-                        ? window.t('status.sidecar_chat.error_timeout')
-                        : window.t('status.sidecar_chat.error_network');
-                } finally {
-                    clearTimeout(timer);
-                    this.sidecarChat.loading = false;
-                }
-            },
-
-            clearSidecarChat() {
-                this.sidecarChat.messages = [];
-                this.sidecarChat.error = '';
-            },
 
             formatNumber(num) {
                 if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
