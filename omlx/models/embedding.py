@@ -4,7 +4,7 @@ MLX Embedding Model wrapper.
 
 This module provides a wrapper around mlx-embeddings for generating
 text embeddings using Apple's MLX framework, with native fallback
-for XLMRoBERTa and BERT embedding models.
+for XLMRoBERTa, BERT, and Qwen2-decoder embedding models.
 """
 
 import inspect
@@ -22,6 +22,16 @@ from .mlx_embeddings_compat import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_EMBEDDING_MAX_LENGTH = 512
+_TOKENIZER_MAX_LENGTH_SENTINEL = 10**18
+_CONTEXT_LENGTH_ATTRS = (
+    "max_position_embeddings",
+    "max_seq_len",
+    "max_seq_length",
+    "seq_length",
+    "n_positions",
+)
 
 
 @dataclass
@@ -48,6 +58,8 @@ class MLXEmbeddingModel:
     Supports:
     - Native XLMRoBERTa embedding (no mlx-embeddings dependency)
     - Native BERT embedding (no mlx-embeddings dependency)
+    - Native Qwen2-decoder embedding (last-token + L2; jina-code, gte-Qwen2)
+      — mlx-embeddings has no qwen2 module
     - mlx-embeddings fallback for other architectures
 
     Example:
@@ -83,7 +95,6 @@ class MLXEmbeddingModel:
 
         Returns True if native loading succeeded, False otherwise.
         """
-        from safetensors import safe_open
         from transformers import AutoTokenizer
 
         model_path = Path(self.model_name)
@@ -102,8 +113,14 @@ class MLXEmbeddingModel:
         architectures = config_dict.get("architectures", [])
         arch = architectures[0] if architectures else ""
 
-        native_arches = {"XLMRobertaModel", "BertModel", "BertForMaskedLM"}
-        if arch not in native_arches:
+        native_arch_modules = {
+            "XLMRobertaModel": "xlm_roberta",
+            "BertModel": "xlm_roberta",
+            "BertForMaskedLM": "xlm_roberta",
+            "Qwen2ForCausalLM": "qwen2_embedding",
+        }
+        module_name = native_arch_modules.get(arch)
+        if module_name is None:
             logger.debug(
                 f"Architecture '{arch}' not natively supported for embedding, "
                 "trying mlx-embeddings"
@@ -111,7 +128,11 @@ class MLXEmbeddingModel:
             return False
 
         try:
-            from .xlm_roberta import Model, ModelArgs
+            from importlib import import_module
+
+            native_module = import_module(f"{__package__}.{module_name}")
+            Model = native_module.Model
+            ModelArgs = native_module.ModelArgs
 
             known_fields = {f.name for f in ModelArgs.__dataclass_fields__.values()}
             model_config = {
@@ -129,14 +150,17 @@ class MLXEmbeddingModel:
                 return False
 
             for wf in weight_files:
-                with safe_open(wf, framework="mlx") as f:
-                    for key in f.keys():
-                        weights[key] = f.get_tensor(key)
+                weights.update(mx.load(str(wf)))
 
             weights = model_instance.sanitize(weights)
             self._validate_native_weights(model_instance, weights)
             model_instance.load_weights(list(weights.items()), strict=False)
             mx.eval(model_instance.parameters())
+            # Embedding inference must be deterministic: put the model in eval
+            # mode so dropout (p>0 in XLM-RoBERTa/BERT) is disabled. Without this
+            # every /v1/embeddings call applies random dropout, producing
+            # non-deterministic, corrupted vectors.
+            model_instance.train(False)
 
             try:
                 tokenizer = AutoTokenizer.from_pretrained(
@@ -310,6 +334,76 @@ class MLXEmbeddingModel:
             return [{"text": text} for text in inputs]
         return [dict(item) for item in inputs]
 
+    @staticmethod
+    def _positive_context_length(value: Any) -> Optional[int]:
+        """Return a usable positive context length from config/tokenizer metadata."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        if 0 < value < _TOKENIZER_MAX_LENGTH_SENTINEL:
+            return value
+        return None
+
+    @classmethod
+    def _get_config_value(cls, config: Any, key: str) -> Optional[int]:
+        if config is None:
+            return None
+        if isinstance(config, dict):
+            return cls._positive_context_length(config.get(key))
+        return cls._positive_context_length(getattr(config, key, None))
+
+    @classmethod
+    def _context_length_from_config(cls, config: Any) -> Optional[int]:
+        """Read context length from model config objects or dictionaries."""
+        for key in _CONTEXT_LENGTH_ATTRS:
+            value = cls._get_config_value(config, key)
+            if value is not None:
+                return value
+
+        for nested_key in ("text_config", "language_config"):
+            nested = None
+            if isinstance(config, dict):
+                nested = config.get(nested_key)
+            elif config is not None:
+                nested = getattr(config, nested_key, None)
+            for key in _CONTEXT_LENGTH_ATTRS:
+                value = cls._get_config_value(nested, key)
+                if value is not None:
+                    return value
+
+        return None
+
+    def _resolve_max_length(self, max_length: int | None) -> int:
+        """Resolve embedding token length when callers omit an explicit limit."""
+        if max_length is not None:
+            value = self._positive_context_length(max_length)
+            if value is None:
+                raise ValueError("max_length must be a positive integer")
+            return value
+
+        for config in (
+            getattr(self.model, "config", None),
+            getattr(self.processor, "config", None),
+        ):
+            value = self._context_length_from_config(config)
+            if value is not None:
+                return value
+
+        processor = self.processor
+        tokenizers = [
+            processor,
+            getattr(processor, "tokenizer", None),
+            getattr(processor, "_tokenizer", None),
+        ]
+        for tokenizer in tokenizers:
+            for attr_name in ("model_max_length", "max_length"):
+                value = self._positive_context_length(
+                    getattr(tokenizer, attr_name, None)
+                )
+                if value is not None:
+                    return value
+
+        return _DEFAULT_EMBEDDING_MAX_LENGTH
+
     def _prepare_embedding_inputs(
         self,
         processor,
@@ -407,7 +501,7 @@ class MLXEmbeddingModel:
     def embed(
         self,
         inputs: Union[str, List[str], List[Dict[str, str]]],
-        max_length: int = 512,
+        max_length: int | None = None,
         padding: bool = True,
         truncation: bool = True,
     ) -> EmbeddingOutput:
@@ -416,7 +510,8 @@ class MLXEmbeddingModel:
 
         Args:
             texts: List of input texts
-            max_length: Maximum token length for each text
+            max_length: Maximum token length for each text. If omitted, use
+                model/tokenizer metadata when available.
             padding: Whether to pad shorter sequences
             truncation: Whether to truncate longer sequences
 
@@ -426,6 +521,7 @@ class MLXEmbeddingModel:
         if not self._loaded:
             self.load()
 
+        max_length = self._resolve_max_length(max_length)
         normalized_inputs = self._normalize_embedding_inputs(inputs)
         input_texts = [item["text"] for item in normalized_inputs if "text" in item]
         has_image_inputs = any("image" in item for item in normalized_inputs)
@@ -459,7 +555,9 @@ class MLXEmbeddingModel:
                 masks = []
                 for text in input_texts:
                     enc = processor.encode(text, add_special_tokens=True)
-                    ids = list(enc.ids)[:max_length]
+                    ids = list(enc.ids)
+                    if truncation:
+                        ids = ids[:max_length]
                     encoded_ids.append(ids)
                 max_len = max(len(ids) for ids in encoded_ids)
                 padded = []

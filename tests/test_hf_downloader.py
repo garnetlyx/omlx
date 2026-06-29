@@ -756,6 +756,17 @@ class TestHFDownloaderRoutes:
         (model_b / "config.json").write_text('{"architectures": ["Qwen2ForCausalLM"]}')
         (model_b / "model.safetensors").write_bytes(b"y" * 2048)
 
+        # Mixed-case models to verify case-insensitive sort: "Zebra-Model" must sort after "apple-model".
+        model_z = model_dir / "Zebra-Model"
+        model_z.mkdir()
+        (model_z / "config.json").write_text('{"architectures": ["TestZ"]}')
+        (model_z / "model.safetensors").write_bytes(b"z" * 512)
+
+        model_apple = model_dir / "apple-model"
+        model_apple.mkdir()
+        (model_apple / "config.json").write_text('{"architectures": ["TestA"]}')
+        (model_apple / "model.safetensors").write_bytes(b"a" * 256)
+
         # Directory without config.json (should be excluded)
         (model_dir / "not-a-model").mkdir()
 
@@ -769,6 +780,15 @@ class TestHFDownloaderRoutes:
     async def test_list_models(self, model_dir_with_models):
         """Test the list_hf_models endpoint logic."""
         from omlx.admin.routes import list_hf_models, _get_global_settings
+
+        nested_model = (
+            model_dir_with_models / "deepsweet" / "Qwen3.6-27B-MLX-oQ5-FP16"
+        )
+        nested_model.mkdir(parents=True)
+        (nested_model / "config.json").write_text(
+            '{"architectures": ["Qwen2ForCausalLM"]}'
+        )
+        (nested_model / "model.safetensors").write_bytes(b"q" * 4096)
 
         # Create a mock global settings
         mock_settings = MagicMock()
@@ -785,17 +805,35 @@ class TestHFDownloaderRoutes:
             result = await list_hf_models(is_admin=True)
             models = result["models"]
 
-            assert len(models) == 2
+            assert len(models) == 5
             names = [m["name"] for m in models]
             assert "model-a" in names
             assert "model-b" in names
+            assert "Zebra-Model" in names
+            assert "apple-model" in names
+            assert "Qwen3.6-27B-MLX-oQ5-FP16" in names
             assert "not-a-model" not in names
             assert ".hidden" not in names
+
+            display_names = {m["name"]: m["display_name"] for m in models}
+            assert (
+                display_names["Qwen3.6-27B-MLX-oQ5-FP16"]
+                == "deepsweet/Qwen3.6-27B-MLX-oQ5-FP16"
+            )
+            assert display_names["model-a"] == "model-a"
 
             for m in models:
                 assert "size" in m
                 assert "size_formatted" in m
                 assert m["size"] > 0
+
+            # Models must be returned case-insensitive ascending by display name.
+            displays = [m["display_name"] for m in models]
+            expected = sorted(displays, key=str.lower)
+            assert displays == expected, (
+                f"Expected case-insensitive ascending order. "
+                f"Got {displays}, expected {expected}"
+            )
         finally:
             routes_module._get_global_settings = original
 

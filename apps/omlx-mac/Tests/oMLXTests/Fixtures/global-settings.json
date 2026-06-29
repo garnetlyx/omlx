@@ -31,6 +31,7 @@
     },
     "scheduler": {
         "max_concurrent_requests": 8,
+        "embedding_batch_size": 32,
         "chunked_prefill": true
     },
     "cache": {
@@ -45,7 +46,8 @@
         "config_path": null
     },
     "huggingface": {
-        "endpoint": "https://hf-mirror.com"
+        "endpoint": "https://hf-mirror.com",
+        "hf_cache_enabled": true
     },
     "modelscope": {
         "endpoint": ""

@@ -54,7 +54,7 @@
 
 ### macOS App
 
-Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. Note that the macOS app does not install the `omlx` CLI command. For terminal usage, install via Homebrew or from source.
+Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. The macOS app also installs a lightweight `~/.omlx/bin/omlx` CLI shim so terminal commands and Apple Shortcuts can control the app-managed server.
 
 ### Homebrew
 
@@ -66,10 +66,16 @@ brew install omlx
 brew update && brew upgrade omlx
 
 # Run as a background service (auto-restarts on crash)
-brew services start omlx
+omlx start
 
 # Optional: MCP (Model Context Protocol) support
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+```
+
+Optional GLM-5.2 / MiniMax M3 native custom kernels currently require a HEAD build:
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
 ```
 
 ### From Source
@@ -79,6 +85,9 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # Core only
 pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
+
+# Optional: GLM-5.2 / MiniMax M3 native custom kernels
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
 Requires macOS 15.0+ (Sequoia), Python 3.10+, and Apple Silicon (M1/M2/M3/M4).
@@ -97,6 +106,12 @@ Launch oMLX from your Applications folder. The Welcome screen guides you through
 ### CLI
 
 ```bash
+# Managed background server (macOS app or Homebrew install)
+omlx start
+omlx stop
+omlx restart
+
+# Foreground server attached to this terminal
 omlx serve --model-dir ~/models
 ```
 
@@ -107,13 +122,17 @@ The server discovers LLMs, VLMs, embedding models, and rerankers from subdirecto
 If you installed via Homebrew, you can run oMLX as a managed background service:
 
 ```bash
+omlx start                    # Start via brew services
+omlx stop                     # Stop
+omlx restart                  # Restart
+
 brew services start omlx    # Start (auto-restarts on crash)
 brew services stop omlx     # Stop
 brew services restart omlx  # Restart
 brew services info omlx     # Check status
 ```
 
-The service runs `omlx serve` with zero-config defaults (`~/.omlx/models`, port 8000). To customize, either set environment variables (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) or run `omlx serve --model-dir /your/path` once to persist settings to `~/.omlx/settings.json`.
+The service runs `omlx serve` with zero-config defaults (`~/.omlx/models`, port 8000). `omlx start`, `omlx stop`, and `omlx restart` are the portable lifecycle commands; Homebrew installs delegate them to `brew services`. To customize, either set environment variables (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) or run `omlx serve --model-dir /your/path` once to persist settings to `~/.omlx/settings.json`.
 
 Logs are written to two locations:
 - **Service log**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
@@ -125,7 +144,7 @@ Supports text LLMs, vision-language models (VLM), OCR models, embeddings, and re
 
 ### Admin Dashboard
 
-Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. Supports English, Korean, Japanese, Chinese, French, and Russian. All CDN dependencies are vendored for fully offline operation.
+Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. Supports English, Korean, Japanese, Chinese, French, Russian, Spanish, and Brazilian Portuguese. All CDN dependencies are vendored for fully offline operation.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
@@ -170,6 +189,7 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 - **Model alias**: set a custom API-visible name. `/v1/models` returns the alias, and requests accept both the alias and directory name.
 - **Model type override**: manually set a model as LLM or VLM regardless of auto-detection.
+- **Profiles**: save named bundles of per-model settings and switch between them from the admin panel. A profile can optionally be exposed as its own model: `/v1/models` then also lists `<model>:<profile>` (e.g. `qwen3-8b:thinking`), which serves on the same engine as the base model with the profile's settings overlaid per request — no extra memory, no reload. When the base model has an alias, the exposed ID is advertised as `<alias>:<profile>`; the directory-name form keeps working, just like for the base model.
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX Chat Template Kwargs" width="480">
@@ -272,8 +292,19 @@ Models are auto-detected by type. You can also download models directly from the
 ## CLI Configuration
 
 ```bash
+# Managed background server (macOS app or Homebrew install)
+omlx start
+omlx stop
+omlx restart
+
 # Start with default settings (memory guard tier = balanced, manage via admin UI)
 omlx serve --model-dir ~/models
+
+# Choose a memory guard tier at startup
+omlx serve --model-dir ~/models --memory-guard safe
+
+# Set a custom memory guard ceiling in GB
+omlx serve --model-dir ~/models --memory-guard-gb 48
 
 # Enable SSD cache for KV blocks
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
@@ -346,6 +377,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# Stage with optional GLM-5.2 / MiniMax M3 native custom kernels
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the layer configuration and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.

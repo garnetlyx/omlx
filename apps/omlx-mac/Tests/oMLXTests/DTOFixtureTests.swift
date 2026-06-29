@@ -81,6 +81,8 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(settings.auth,          "auth block missing")
         XCTAssertNotNil(settings.claudeCode,    "claude_code block missing")
         XCTAssertNotNil(settings.integrations,  "integrations block missing")
+        XCTAssertEqual(settings.scheduler?.embeddingBatchSize, 32)
+        XCTAssertEqual(settings.huggingface?.hfCacheEnabled, true)
     }
 
     // MARK: - Models list
@@ -96,6 +98,7 @@ final class DTOFixtureTests: XCTestCase {
         // Sanity-check the first entry's shape if present.
         if let first = list.models.first {
             XCTAssertFalse(first.id.isEmpty, "ModelDTO.id must be non-empty.")
+            XCTAssertEqual(first.displayName, "deepsweet/Qwen3.6-27B-UD-MLX-4bit")
         }
     }
 
