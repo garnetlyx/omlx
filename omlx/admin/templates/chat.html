@@ -3956,10 +3956,14 @@
             );
 
             // Merge DS4 sidecar models (routed directly through Sub2API, not omlx).
+            // The selector and message badges bind to `model.name`, so the alias
+            // must be carried as `name` too (mirroring how omlx-side models are
+            // built at { id, name, owned_by } above), otherwise the option and
+            // the assistant badge render as an empty string.
             await this.loadSidecarConfig();
             for (const sm of this.sidecarConfig.models) {
                 if (!this.availableModels.some(m => m.id === sm)) {
-                    this.availableModels.push({ id: sm, _sidecar: true });
+                    this.availableModels.push({ id: sm, name: sm, _sidecar: true });
                 }
             }
 
