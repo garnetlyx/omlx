@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from omlx.admin.oq_manager import OQManager
+from omlx.admin.oq_manager import OQManager, QuantStatus, QuantTask
 
 
 @pytest.fixture
@@ -179,3 +179,62 @@ class TestOQManagerDtypeSupport:
 
         assert manager._tasks == {}
         assert not (root / "DeepSeek-V4-Flash-oQ4-fp16").exists()
+
+
+class TestOQManagerProgress:
+    def test_byte_level_quant_progress_disables_time_estimator(self):
+        task = QuantTask(
+            task_id="task",
+            model_name="Model",
+            model_path="/tmp/Model",
+            oq_level=2.5,
+            output_name="Model-oQ2.5e",
+            output_path="/tmp/Model-oQ2.5e",
+            status=QuantStatus.QUANTIZING,
+            progress=39.0,
+            progress_meta={"processed_bytes": 31, "total_bytes": 100},
+        )
+
+        assert OQManager._has_explicit_quant_progress(task) is True
+
+    def test_non_byte_quant_progress_can_use_time_estimator(self):
+        task = QuantTask(
+            task_id="task",
+            model_name="Model",
+            model_path="/tmp/Model",
+            oq_level=2.5,
+            output_name="Model-oQ2.5e",
+            output_path="/tmp/Model-oQ2.5e",
+            status=QuantStatus.QUANTIZING,
+            progress=30.0,
+            progress_meta={},
+        )
+
+        assert OQManager._has_explicit_quant_progress(task) is False
+
+
+class TestOQManagerEnhanced:
+    @pytest.mark.asyncio
+    async def test_start_quantization_uses_enhanced_name_and_cache_path(
+        self, fp_model_dir, monkeypatch
+    ):
+        manager = OQManager(model_dirs=[str(fp_model_dir)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+
+        task = await manager.start_quantization(
+            str(fp_model_dir / "Llama-3B"),
+            4,
+            enhanced=True,
+            imatrix_num_samples=8,
+            imatrix_seq_length=128,
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.enhanced is True
+        assert task.output_name == "Llama-3B-oQ4e"
+        assert ".oqe_imatrix" in task.imatrix_cache_path
+        assert task.imatrix_cache_path.endswith("-s8-l128.npz")

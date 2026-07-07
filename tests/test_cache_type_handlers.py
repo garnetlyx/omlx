@@ -160,6 +160,7 @@ class TestKVCacheHandlerWithMLX:
         """Import MLX or skip."""
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -524,6 +525,7 @@ class TestRotatingKVCacheHandlerWithMLX:
         """Import MLX or skip."""
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -898,6 +900,9 @@ class TestCacheTypeRegistry:
         handler = CacheTypeRegistry.get_handler_by_class_name("RotatingKVCache")
         assert isinstance(handler, RotatingKVCacheHandler)
 
+        handler = CacheTypeRegistry.get_handler_by_class_name("BufferedRotatingKVCache")
+        assert isinstance(handler, RotatingKVCacheHandler)
+
     def test_get_handler_by_class_name_unknown(self):
         """Test getting handler for unknown class name."""
         handler = CacheTypeRegistry.get_handler_by_class_name("UnknownCache")
@@ -919,7 +924,17 @@ class TestCacheTypeRegistry:
         # RotatingKVCache-like
         mock_rotating = MagicMock()
         mock_rotating.__class__.__name__ = "RotatingKVCache"
-        assert CacheTypeRegistry.detect_cache_type(mock_rotating) == CacheType.ROTATING_KVCACHE
+        assert (
+            CacheTypeRegistry.detect_cache_type(mock_rotating)
+            == CacheType.ROTATING_KVCACHE
+        )
+
+        mock_buffered = MagicMock()
+        mock_buffered.__class__.__name__ = "BufferedRotatingKVCache"
+        assert (
+            CacheTypeRegistry.detect_cache_type(mock_buffered)
+            == CacheType.ROTATING_KVCACHE
+        )
 
     def test_detect_cache_type_by_attributes(self):
         """Test detecting cache type by attributes when class name unknown."""
@@ -979,6 +994,7 @@ class TestCacheTypeRegistry:
         names = CacheTypeRegistry.list_known_class_names()
         assert "KVCache" in names
         assert "RotatingKVCache" in names
+        assert "BufferedRotatingKVCache" in names
         assert "ArraysCache" in names
 
     def test_register_handler(self):
@@ -1167,6 +1183,7 @@ class TestCacheListHandlerWithMLX:
         """Import MLX or skip."""
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -1197,9 +1214,8 @@ class TestCacheListHandlerWithMLX:
         assert hasattr(cache, "caches")
         assert len(cache.caches) == 2
 
-    def test_reconstruct_cache_kvcache_no_fallback(self, handler, mx):
-        """Test CacheList with KVCache sub-caches succeeds via from_state()
-        without falling back to manual reconstruction (GLM-5 scenario)."""
+    def test_reconstruct_cache_kvcache_subs_via_handlers(self, handler, mx):
+        """Test CacheList with KVCache sub-caches succeeds via local handlers."""
         keys1 = mx.zeros((1, 8, 64, 64))
         values1 = mx.zeros((1, 8, 64, 64))
         keys2 = mx.zeros((1, 8, 64, 64))
@@ -1215,20 +1231,42 @@ class TestCacheListHandlerWithMLX:
             ["", ""],
         )
 
-        import logging
-        from unittest.mock import patch
-
-        with patch.object(
-            logging.getLogger("omlx.cache.type_handlers"), "debug"
-        ) as mock_debug:
-            cache = handler.reconstruct_cache(state, meta_state)
+        cache = handler.reconstruct_cache(state, meta_state)
 
         assert cache is not None
         assert hasattr(cache, "caches")
         assert len(cache.caches) == 2
-        # Verify from_state() succeeded without fallback
-        for call_args in mock_debug.call_args_list:
-            assert "from_state() unavailable or failed" not in str(call_args)
+
+    def test_reconstruct_cache_rotating_sub_cache_uses_handler(self, handler, mx):
+        """Nested RotatingKVCache restores as trimmed PrefillReadyRotatingKVCache."""
+        from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache
+
+        keys = mx.arange(255).reshape(1, 1, 255, 1)
+        values = mx.arange(1000, 1255).reshape(1, 1, 255, 1)
+        expected_keys = keys[..., -128:, :]
+        expected_values = values[..., -128:, :]
+
+        state = {
+            "sub_states": [(keys, values)],
+        }
+        meta_state = (
+            ["RotatingKVCache"],
+            [("0", "128", "1280", "255")],
+        )
+
+        cache = handler.reconstruct_cache(state, meta_state)
+
+        assert cache is not None
+        assert hasattr(cache, "caches")
+        assert len(cache.caches) == 1
+        sub_cache = cache.caches[0]
+        assert isinstance(sub_cache, PrefillReadyRotatingKVCache)
+        assert sub_cache.keys.shape == (1, 1, 128, 1)
+        assert sub_cache.values.shape == (1, 1, 128, 1)
+        assert bool(mx.all(sub_cache.keys == expected_keys).item())
+        assert bool(mx.all(sub_cache.values == expected_values).item())
+        assert sub_cache.offset == 1280
+        assert sub_cache._idx == 128
 
     def test_reconstruct_cache_mixed_types(self, handler, mx):
         """Test reconstructing CacheList with ArraysCache + KVCache."""

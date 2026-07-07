@@ -553,6 +553,195 @@ class TestStreamingHelperFunctions:
         assert data["choices"][0]["delta"].get("role") == "assistant"
 
     @pytest.mark.asyncio
+    async def test_stream_chat_completion_prompt_opened_thinking_streams_as_reasoning(self):
+        """If the rendered prompt opens <think>, initial deltas are reasoning."""
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        class PromptOpenedThinkingTokenizer(MockTokenizer):
+            think_start = "<think>"
+            think_end = "</think>"
+            think_start_id = 999
+            think_end_id = 998
+            unk_token_id = -1
+
+            def convert_tokens_to_ids(self, token: str):
+                if token == self.think_start:
+                    return self.think_start_id
+                if token == self.think_end:
+                    return self.think_end_id
+                return self.unk_token_id
+
+            def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+                ids = [101]
+                if text.rstrip().endswith(self.think_start):
+                    ids.append(self.think_start_id)
+                return ids
+
+            def apply_chat_template(
+                self, messages: list[dict], tokenize: bool = False, **kwargs
+            ) -> str:
+                return "user: Hi\nassistant:<think>"
+
+        engine = MockBaseEngine()
+        engine._tokenizer = PromptOpenedThinkingTokenizer()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Need to inspect first.",
+                new_text="Need to inspect first.",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="Need to inspect first.</think>Done.",
+                new_text="</think>Done.",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+        )
+
+        payloads = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+        ):
+            if event.startswith("data: {"):
+                payloads.append(json.loads(event[6:-2]))
+
+        reasoning_deltas = []
+        content_deltas = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            if delta.get("reasoning_content"):
+                reasoning_deltas.append(delta["reasoning_content"])
+            if delta.get("content"):
+                content_deltas.append(delta["content"])
+
+        assert "".join(reasoning_deltas) == "Need to inspect first."
+        assert content_deltas == ["Done."]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_partial_prompt_opened_thinking(self):
+        """Partial-mode prompt detection must mirror continue_final_message."""
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        class PartialThinkingTokenizer(MockTokenizer):
+            think_start = "<think>"
+            think_end = "</think>"
+            think_start_id = 999
+            think_end_id = 998
+            unk_token_id = -1
+
+            def __init__(self):
+                super().__init__()
+                self.template_kwargs = None
+
+            def convert_tokens_to_ids(self, token: str):
+                if token == self.think_start:
+                    return self.think_start_id
+                if token == self.think_end:
+                    return self.think_end_id
+                return self.unk_token_id
+
+            def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+                ids = [101]
+                if text.rstrip().endswith(self.think_start):
+                    ids.append(self.think_start_id)
+                return ids
+
+            def apply_chat_template(
+                self, messages: list[dict], tokenize: bool = False, **kwargs
+            ) -> str:
+                self.template_kwargs = dict(kwargs)
+                assert all("partial" not in message for message in messages)
+                if (
+                    kwargs.get("add_generation_prompt") is False
+                    and kwargs.get("continue_final_message") is True
+                ):
+                    return "user: Hi\nassistant:<think>"
+                return "user: Hi\nassistant:"
+
+        engine = MockBaseEngine()
+        engine._tokenizer = PartialThinkingTokenizer()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Hidden reasoning.",
+                new_text="Hidden reasoning.",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="Hidden reasoning.</think>Visible.",
+                new_text="</think>Visible.",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                Message(role="user", content="Hi"),
+                Message(role="assistant", content="", partial=True),
+            ],
+            stream=True,
+        )
+
+        payloads = []
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "", "partial": True},
+        ]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            is_partial=True,
+        ):
+            if event.startswith("data: {"):
+                payloads.append(json.loads(event[6:-2]))
+
+        reasoning_deltas = []
+        content_deltas = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            if delta.get("reasoning_content"):
+                reasoning_deltas.append(delta["reasoning_content"])
+            if delta.get("content"):
+                content_deltas.append(delta["content"])
+
+        assert engine.tokenizer.template_kwargs["add_generation_prompt"] is False
+        assert engine.tokenizer.template_kwargs["continue_final_message"] is True
+        assert messages[-1]["partial"] is True
+        assert "".join(reasoning_deltas) == "Hidden reasoning."
+        assert content_deltas == ["Visible."]
+
+    @pytest.mark.asyncio
     async def test_stream_chat_completion_with_tools_streams_content_incrementally(self):
         """Tool availability must not force full buffering of normal text deltas."""
         from omlx.server import stream_chat_completion
@@ -945,6 +1134,91 @@ class TestStreamingHelperFunctions:
         assert len(tool_use_blocks) == 1
         assert tool_use_blocks[0]["name"] == "get_weather"
         assert "tool_use" in stop_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_starts_parser_when_prompt_opens_thinking(self):
+        """Prompt-opened thinking must stream as thinking, not public text."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        class PromptOpenedThinkingTokenizer(MockTokenizer):
+            think_start = "<think>"
+            think_end = "</think>"
+            think_start_id = 9001
+            think_end_id = 9002
+
+            def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+                if text.rstrip().endswith(self.think_start):
+                    return [101, self.think_start_id]
+                return [101]
+
+            def apply_chat_template(
+                self, messages: List[Dict], tokenize: bool = False, **kwargs
+            ) -> str:
+                return "system: hidden\nuser: hi\nassistant:<think>"
+
+        engine = MockBaseEngine()
+        engine._tokenizer = PromptOpenedThinkingTokenizer()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="The user asked a simple informational question.</think>",
+                new_text="The user asked a simple informational question.</think>",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "The user asked a simple informational question.</think>"
+                    "Visible answer."
+                ),
+                new_text="Visible answer.",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+        )
+
+        events = []
+        async for event in stream_anthropic_messages(
+            engine,
+            [{"role": "user", "content": "Hi"}],
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    parsed_events.append(json.loads(line[6:]))
+
+        thinking_deltas = []
+        text_deltas = []
+        for event in parsed_events:
+            if event.get("type") != "content_block_delta":
+                continue
+            delta = event.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                thinking_deltas.append(delta["thinking"])
+            elif delta.get("type") == "text_delta":
+                text_deltas.append(delta["text"])
+
+        streamed_thinking = "".join(thinking_deltas)
+        streamed_text = "".join(text_deltas)
+        assert "The user asked a simple informational question." in streamed_thinking
+        assert "The user asked a simple informational question." not in streamed_text
+        assert streamed_text == "Visible answer."
 
     @pytest.mark.asyncio
     async def test_anthropic_tool_only_stream_starts_with_tool_use_block(self):
