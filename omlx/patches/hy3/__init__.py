@@ -92,6 +92,65 @@ def _register_model_type_aliases() -> None:
         sys.modules.setdefault("mlx_lm.models.hy_v3_mtp", base_module)
 
 
+def _register_tool_parser_modules() -> None:
+    """Expose Hy3 tool parsers to mlx-lm and teach ``_infer_tool_parser`` to
+    recognize Hy3's ``:opensource`` chat templates.
+
+    Mirrors ``deepseek_v4/tokenizer_patch.py::apply_load_patch`` step 1-2:
+    (1) register vendored parser modules at ``mlx_lm.tool_parsers.*`` so
+    mlx-lm's ``TokenizerWrapper`` can import them by name; (2) wrap
+    ``_infer_tool_parser`` to detect the Hy3 chat template and select
+    ``hy_v3_opensource`` for it.
+
+    Sentinel detection: Hy3's chat template (chat_template.jinja) defines
+    tokens via Jinja format strings like ``<arg_key{}>`` where ``{}`` is
+    filled by the ``HYTK = ':opensource'`` variable at render time. So the
+    raw template contains the literal substring ``<arg_key{}>``, not the
+    rendered ``<arg_key:opensource>``. We match the literal Jinja pattern
+    so detection works before the template is rendered.
+
+    Idempotent via the ``_omlx_hy3_patched`` marker on the wrapper.
+    """
+    try:
+        import mlx_lm.tokenizer_utils as _tu
+
+        from .tools import hy_v3 as _hy3_tools
+        from .tools import hy_v3_opensource as _hy3_os_tools
+
+        sys.modules.setdefault("mlx_lm.tool_parsers.hy_v3", _hy3_tools)
+        sys.modules.setdefault(
+            "mlx_lm.tool_parsers.hy_v3_opensource", _hy3_os_tools
+        )
+
+        orig_infer = getattr(_tu, "_infer_tool_parser", None)
+        if orig_infer is not None and not getattr(
+            orig_infer, "_omlx_hy3_patched", False
+        ):
+
+            def _infer_tool_parser(chat_template):
+                # Hy3's chat_template.jinja uses ``HYTK = ':opensource'``
+                # variable with ``<arg_key{}>``.format(HYTK) pattern —
+                # match the literal Jinja source.
+                if (
+                    isinstance(chat_template, str)
+                    and "<arg_key{}>" in chat_template
+                ):
+                    return "hy_v3_opensource"
+                # Some checkpoints may store the pre-rendered template.
+                if (
+                    isinstance(chat_template, str)
+                    and "<arg_key:opensource>" in chat_template
+                ):
+                    return "hy_v3_opensource"
+                return orig_infer(chat_template)
+
+            _infer_tool_parser._omlx_hy3_patched = True
+            _tu._infer_tool_parser = _infer_tool_parser
+        logger.info("Hy3 tool parsers registered (hy_v3, hy_v3_opensource)")
+    except Exception as e:
+        logger.debug("Hy3 tool parser registration skipped: %s", e)
+
+
 def apply_hy3_patch() -> bool:
     """Apply the Hy3 base architecture patch to mlx-lm. Idempotent.
 
@@ -123,6 +182,7 @@ def apply_hy3_patch() -> bool:
 
     _register_module("mlx_lm.models.hy_v3", "hy_v3_model.py")
     _register_model_type_aliases()
+    _register_tool_parser_modules()
 
     _APPLIED = True
     logger.info(

@@ -165,6 +165,9 @@ _MINIMAX_TOOL_CALL_END = "]<]minimax[>[</tool_call>"
 _DEEPSEEK_V4_TOOL_CALL_START = "<｜DSML｜tool_calls>"
 _DEEPSEEK_V4_TOOL_CALL_END = "</｜DSML｜tool_calls>"
 
+_HY3_TOOL_CALL_START = "<tool_calls:opensource>"
+_HY3_TOOL_CALL_END = "</tool_calls:opensource>"
+
 
 def _is_deepseek_v4_model(
     model_name: str,
@@ -182,6 +185,24 @@ def _is_deepseek_v4_model(
         return True
 
     return "deepseek-v4" in model_name.lower() or "deepseek_v4" in model_name.lower()
+
+
+def _is_hy_v3_model(
+    model_name: str,
+    tokenizer: Any,
+    model_config: dict[str, Any] | None = None,
+) -> bool:
+    model_type = str(model_config.get("model_type", "")) if model_config else ""
+    if model_type.startswith("hy_v3"):
+        return True
+
+    if (
+        getattr(tokenizer, "tool_call_start", None) == _HY3_TOOL_CALL_START
+        and getattr(tokenizer, "tool_call_end", None) == _HY3_TOOL_CALL_END
+    ):
+        return True
+
+    return False
 
 
 def _serialize_minimax_tool_arguments(arguments: Any) -> str:
@@ -394,6 +415,126 @@ class DeepSeekV4OutputParserSession:
                 )
         except Exception as e:  # noqa: BLE001
             logger.debug("DeepSeek V4 tool-call parse failed: %s", e)
+
+        return OutputParserFinalizeResult(
+            stream_text=stream_text,
+            visible_text=visible_text,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else None,
+        )
+
+
+class Hy3OutputParserSession:
+    """Parser session for Tencent Hy3 (hy_v3) tool-call output.
+
+    Mirrors ``DeepSeekV4OutputParserSession`` but uses Hy3's
+    ``<tool_calls:opensource>`` / ``</tool_calls:opensource>`` sentinels
+    (set on the tokenizer by the Hy3 tool_parser registration). A
+    completed tool-call block ends the assistant turn.
+    """
+
+    def __init__(self, tokenizer: Any, model_path: str | None = None):
+        self._tokenizer = tokenizer
+        self._raw_text = ""
+        self._stopped = False
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
+        if self._detokenizer is not None:
+            self._detokenizer.reset()
+
+        try:
+            from ..api.tool_calling import ToolCallStreamFilter
+
+            self._stream_filter = ToolCallStreamFilter(tokenizer)
+            self._visible_filter = ToolCallStreamFilter(tokenizer)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Hy3 stream filter unavailable: %s", e)
+            self._stream_filter = None
+            self._visible_filter = None
+
+    def _decode_token(self, token_id: int) -> str:
+        if self._detokenizer is not None:
+            self._detokenizer.add_token(token_id)
+            return self._detokenizer.last_segment
+        try:
+            return self._tokenizer.decode([token_id], skip_special_tokens=False)
+        except TypeError:
+            return self._tokenizer.decode([token_id])
+
+    def _filtered_text(self, text: str, tool_filter: Any) -> str:
+        if not text:
+            return ""
+        if tool_filter is not None:
+            return tool_filter.feed(text)
+        return text
+
+    def _finish_filtered_text(self, tool_filter: Any) -> str:
+        if tool_filter is None:
+            return ""
+        return tool_filter.finish()
+
+    def _trim_at_first_tool_block_end(self, text: str) -> tuple[str, bool]:
+        start_idx = text.find(_HY3_TOOL_CALL_START)
+        if start_idx < 0:
+            return text, False
+        end_idx = text.find(_HY3_TOOL_CALL_END, start_idx)
+        if end_idx < 0:
+            return text, False
+        cutoff = end_idx + len(_HY3_TOOL_CALL_END)
+        return text[:cutoff], True
+
+    def process_token(self, token_id: int) -> OutputParserTokenResult:
+        if self._stopped:
+            return OutputParserTokenResult(is_stop=True, record_token=False)
+
+        decoded_text = self._decode_token(token_id)
+        combined = self._raw_text + decoded_text
+        trimmed, is_stop = self._trim_at_first_tool_block_end(combined)
+
+        feed_text = trimmed[len(self._raw_text) :]
+        self._raw_text = trimmed
+        self._stopped = is_stop
+
+        return OutputParserTokenResult(
+            stream_text=self._filtered_text(feed_text, self._stream_filter),
+            visible_text=self._filtered_text(feed_text, self._visible_filter),
+            is_stop=is_stop,
+            record_token=True,
+        )
+
+    def finalize(self) -> OutputParserFinalizeResult:
+        stream_text = ""
+        visible_text = ""
+        if self._detokenizer is not None and not self._stopped:
+            self._detokenizer.finalize()
+            final_text = self._detokenizer.last_segment
+            if final_text:
+                prev_len = len(self._raw_text)
+                combined = self._raw_text + final_text
+                self._raw_text, self._stopped = self._trim_at_first_tool_block_end(
+                    combined
+                )
+                final_text = self._raw_text[prev_len:]
+                stream_text += self._filtered_text(final_text, self._stream_filter)
+                visible_text += self._filtered_text(final_text, self._visible_filter)
+
+        stream_text += self._finish_filtered_text(self._stream_filter)
+        visible_text += self._finish_filtered_text(self._visible_filter)
+
+        tool_calls: list[dict[str, str]] = []
+        try:
+            from ..api.tool_calling import parse_tool_calls
+
+            _, parsed_calls = parse_tool_calls(self._raw_text, self._tokenizer)
+            for call in parsed_calls or []:
+                tool_calls.append(
+                    {
+                        "id": getattr(call, "id", ""),
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Hy3 tool-call parse failed: %s", e)
 
         return OutputParserFinalizeResult(
             stream_text=stream_text,
@@ -734,6 +875,20 @@ def detect_output_parser(
             protocol_marker_texts=(
                 _DEEPSEEK_V4_TOOL_CALL_START,
                 _DEEPSEEK_V4_TOOL_CALL_END,
+            ),
+        )
+
+    if _is_hy_v3_model(model_name, tokenizer, model_config):
+        return OutputParserFactory(
+            kind="hy_v3",
+            create_session=lambda session_tokenizer: Hy3OutputParserSession(
+                session_tokenizer,
+                model_path=model_name,
+            ),
+            stop_token_ids=set(),
+            protocol_marker_texts=(
+                _HY3_TOOL_CALL_START,
+                _HY3_TOOL_CALL_END,
             ),
         )
 

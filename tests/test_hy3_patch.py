@@ -100,3 +100,44 @@ def test_is_mtp_compatible_for_hy_v3():
     assert _is_mtp_compatible({}, "hy_v3") is False
     assert _is_mtp_compatible({"num_nextn_predict_layers": 1}, "hy_v3_opensource") is True
     assert _is_mtp_compatible({"num_nextn_predict_layers": 1}, "gpt2") is False
+
+
+def test_tool_parser_modules_registered():
+    """``apply_hy3_patch`` must expose the Hy3 tool parsers at
+    ``mlx_lm.tool_parsers.{hy_v3,hy_v3_opensource}`` so the mlx-lm
+    ``TokenizerWrapper`` can resolve them by name."""
+    _reset_module_state()
+    from omlx.patches.hy3 import apply_hy3_patch
+
+    apply_hy3_patch()
+    assert "mlx_lm.tool_parsers.hy_v3" in sys.modules
+    assert "mlx_lm.tool_parsers.hy_v3_opensource" in sys.modules
+    base = sys.modules["mlx_lm.tool_parsers.hy_v3"]
+    alias = sys.modules["mlx_lm.tool_parsers.hy_v3_opensource"]
+    # hy_v3_opensource imports parse_tool_call from hy_v3, so the modules
+    # must expose tool_call_start/end sentinels (different per variant).
+    assert base.tool_call_start == "<tool_calls>"
+    assert alias.tool_call_start == "<tool_calls:opensource>"
+
+
+def test_infer_tool_parser_recovers_opensource_suffix():
+    """The wrapped ``_infer_tool_parser`` must select ``hy_v3_opensource``
+    when the chat template contains the Hy3 Jinja pattern ``<arg_key{}>``
+    (render-time ``.format(HYTK)`` of ``:opensource`` suffix) or the
+    pre-rendered ``<arg_key:opensource>`` sentinel. The pinned mlx-lm only
+    knows the unsuffixed sentinel, so without our wrap the parser is
+    misselected and tool_calls come back as raw markup text."""
+    _reset_module_state()
+    from omlx.patches.hy3 import apply_hy3_patch
+
+    apply_hy3_patch()
+    import mlx_lm.tokenizer_utils as _tu
+
+    infer = _tu._infer_tool_parser
+    assert getattr(infer, "_omlx_hy3_patched", False) is True
+    # Hy3 chat_template.jinja uses Jinja format string pattern.
+    assert infer("<...><arg_key{}>{...}</arg_key{}><...>") == "hy_v3_opensource"
+    # Some checkpoints may store pre-rendered templates.
+    assert infer("<...><arg_key:opensource><...>") == "hy_v3_opensource"
+    # Falls through to the original inference for non-Hy3 templates.
+    # (Don't assert the exact fallback value — just that it doesn't crash.)
