@@ -2693,6 +2693,18 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
             except Exception as patch_err:
                 logger.debug(f"deepseek_v4 base patch not applied: {patch_err}")
 
+        # Hy3 isn't in stock mlx-lm — its model class is injected into
+        # ``sys.modules`` by oMLX's base patch (vendors PR #1211 + #1485).
+        # Trigger that here so ``_get_classes(config)`` for hy_v3* model
+        # types succeeds. No-op for other model types.
+        if str(config.get("model_type", "")).startswith("hy_v3"):
+            try:
+                from omlx.patches.hy3 import apply_hy3_patch
+
+                apply_hy3_patch()
+            except Exception as patch_err:
+                logger.debug(f"hy_v3 base patch not applied: {patch_err}")
+
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
         # patched.

@@ -240,6 +240,12 @@ def maybe_apply_pre_load_patches(
         if apply_glm_moe_dsa_patch():
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
 
+    if model_type == "hy_v3":
+        from ..patches.hy3 import apply_hy3_patch
+
+        if apply_hy3_patch():
+            logger.info("Hy3 pre-load patch applied for %s", model_name)
+
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
     if for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
@@ -525,6 +531,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
         or model_type.startswith("deepseek_v4")
+        or model_type.startswith("hy_v3")
     )
 
 

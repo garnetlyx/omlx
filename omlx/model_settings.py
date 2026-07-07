@@ -88,7 +88,7 @@ class ModelSettings:
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
             continuous batches fall back to standard decoding automatically. Compatible
-            model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with
+            model_types: qwen3_5*, qwen3_6*, deepseek_v4*, hy_v3*. Mutually exclusive with
             dflash_enabled and turboquant_kv_enabled.
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
@@ -188,7 +188,7 @@ class ModelSettings:
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
-    # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
+    # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*, hy_v3*. Mutually exclusive
     # with dflash and turboquant.
     mtp_enabled: bool = False
 

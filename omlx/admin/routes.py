@@ -646,11 +646,11 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     model_type = cfg.get("model_type")
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
-    if not _is_mtp_compatible(cfg, model_type):
-        return False, (
-            f"model_type={model_type!r} is not on the MTP whitelist "
-            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*)"
-        )
+        if not _is_mtp_compatible(cfg, model_type):
+            return False, (
+                f"model_type={model_type!r} is not on the MTP whitelist "
+                "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, hy_v3*)"
+            )
     if not _model_has_mtp_weight_tensors(Path(model_path)):
         return False, (
             "Config declares MTP layers but the converted weights are missing "

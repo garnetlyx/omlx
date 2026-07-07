@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native MTP (Multi-Token Prediction) monkey-patches for mlx-lm.
 
-This package adapts two upstream PRs into runtime monkey-patches:
+This package adapts three upstream PRs into runtime monkey-patches:
 
-- ml-explore/mlx-lm#990 — Qwen3.5 / Qwen3.6 native MTP heads (dense + MoE)
-- Blaizzy/mlx-lm#15    — DeepSeek-V4-Flash native MTP heads
+- ml-explore/mlx-lm#990  — Qwen3.5 / Qwen3.6 native MTP heads (dense + MoE)
+- Blaizzy/mlx-lm#15      — DeepSeek-V4-Flash native MTP heads
+- ml-explore/mlx-lm#1485 — Tencent Hy3 (hy_v3) native MTP head (stacked on #1211)
 
 Both PRs follow the same shape: a model gains an extra ``mtp`` module + a
 ``mtp_forward`` method and an enhanced ``__call__`` that returns hidden
@@ -78,7 +79,7 @@ def apply_mlx_lm_mtp_patch() -> bool:
         True if the patch is now active. False if a sub-step refused
         to apply (mlx-lm not importable, missing prerequisite patch).
     """
-    from . import batch_generator, cache_rollback, deepseek_v4_model, qwen35_model
+    from . import batch_generator, cache_rollback, deepseek_v4_model, hy_v3_model, qwen35_model
 
     if not cache_rollback.apply():
         return False
@@ -88,6 +89,8 @@ def apply_mlx_lm_mtp_patch() -> bool:
         logger.debug("Qwen3.5/3.6 MTP patch did not apply (likely import error)")
     if not deepseek_v4_model.apply():
         logger.debug("DeepSeek-V4 MTP patch did not apply (likely missing base patch)")
+    if not hy_v3_model.apply():
+        logger.debug("Hy3 MTP patch did not apply (likely missing base patch)")
     if not batch_generator.apply():
         logger.warning(
             "BatchGenerator MTP dispatch patch failed; MTP path will be inactive"
