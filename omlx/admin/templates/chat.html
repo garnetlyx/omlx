@@ -4911,7 +4911,43 @@
                     if (line.startsWith('data: ')) {
                         try {
                             const data = JSON.parse(line.slice(6));
+
+                            // omlx signals mid-stream backend exceptions as
+                            // `data: {"error":{"message":"...","type":"server_error"}}`
+                            // (see engine_core / server stream paths). Without
+                            // this guard the payload parses fine, choices?.[0]
+                            // is undefined, every delta branch is skipped, and
+                            // the post-loop code at line ~5138 happily pushes
+                            // an assistant message with empty content —
+                            // silently masking real backend errors as blank
+                            // bubbles. Route the error into the outer catch
+                            // so the existing error path renders a red banner.
+                            if (data && data.error) {
+                                const err = data.error;
+                                const e = new Error(
+                                    (err && typeof err.message === 'string' && err.message)
+                                    || (typeof err === 'string' && err)
+                                    || 'Server streaming error'
+                                );
+                                e.serverError = err;
+                                throw e;
+                            }
+
                             const choice = data.choices?.[0];
+
+                            // Mirror the OpenAI "error inside a choice" shape
+                            // some proxies emit mid-stream.
+                            if (choice && choice.error) {
+                                const err = choice.error;
+                                const e = new Error(
+                                    (err && typeof err.message === 'string' && err.message)
+                                    || (typeof err === 'string' && err)
+                                    || 'Choice streaming error'
+                                );
+                                e.choiceError = err;
+                                throw e;
+                            }
+
                             const delta = choice?.delta;
                             if (choice?.finish_reason) finishReason = choice.finish_reason;
 
