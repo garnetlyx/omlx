@@ -56,6 +56,53 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
     stub = os.environ.get("OMLX_GDN_STUB", "0") == "1"
     original = gd.gated_delta_update
 
+    # Resolve g/beta compute helpers across mlx_vlm API revisions.
+    #
+    # - Older mlx_vlm exposed ``gd._compute_g_beta(A_log, a, b, dt_bias)`` returning
+    #   ``(g, beta)`` and optionally ``gd._compute_g_beta_prefill`` for the fused
+    #   Metal path. Patching that contract worked up to mlx_vlm ~0.4.
+    # - mlx_vlm 0.5+ imports ``compute_g`` from ``mlx_lm.models.gated_delta``
+    #   and computes ``beta = mx.sigmoid(b)`` inline at every call site. The
+    #   ``_compute_g_beta*`` attributes are gone, so the previous patch path
+    #   raised AttributeError mid-prefill and surfaced as empty SSE responses.
+    #
+    # Fast path preference order (matches the production contract of
+    # ``gated_delta_blocked_seq`` / ``gated_delta_chunked_metal`` which both
+    # expect ``g`` and ``beta`` of shape ``(B, T, Hv)`` fp32):
+    #   1. ``gd._compute_g_beta_prefill`` (legacy fused Metal helper)
+    #   2. ``gd._compute_g_beta`` (legacy 4-arg tuple helper)
+    #   3. ``mlx_lm.models.gated_delta.compute_g`` + ``mx.sigmoid(b)`` (new API)
+    #   4. ``mlx_vlm.models.qwen3_5.gated_delta.compute_g`` (re-exported)
+    #
+    # If none of the above are resolvable we log a warning and skip the patch
+    # entirely so the stock mlx_vlm kernel stays in effect.
+    compute_g_beta_prefill = getattr(gd, "_compute_g_beta_prefill", None)
+    compute_g_beta = getattr(gd, "_compute_g_beta", None)
+    new_api_compute_g = getattr(gd, "compute_g", None)
+    if new_api_compute_g is None:
+        try:
+            from mlx_lm.models.gated_delta import compute_g as new_api_compute_g
+        except ImportError:
+            new_api_compute_g = None
+
+    if compute_g_beta_prefill is None and compute_g_beta is None and new_api_compute_g is None:
+        logger.warning(
+            "Qwen3.5/3.6 GDN prefill patch disabled: no _compute_g_beta[_prefill] "
+            "and no mlx_lm.gated_delta.compute_g available on this mlx_vlm/mlx_lm "
+            "build; falling back to stock kernel"
+        )
+        return False
+
+    def _compute_g_beta(A_log, a, b, dt_bias):
+        if compute_g_beta_prefill is not None:
+            return compute_g_beta_prefill(A_log, a, b, dt_bias)
+        if compute_g_beta is not None:
+            return compute_g_beta(A_log, a, b, dt_bias)
+        # New mlx_vlm/mlx_lm API: g = compute_g(A_log, a, dt_bias), beta = sigmoid(b)
+        g = new_api_compute_g(A_log, a, dt_bias)
+        beta = mx.sigmoid(b)
+        return g, beta
+
     from omlx.custom_kernels.qwen35_prefill import (
         gated_delta_blocked_seq,
         gated_delta_chunked_metal,
@@ -84,10 +131,10 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
             and v.shape[-1] % 32 == 0
             and a.ndim == 3  # scalar per-head gating
         ):
-            if fused_g_beta and hasattr(gd, "_compute_g_beta_prefill"):
-                g, beta = gd._compute_g_beta_prefill(A_log, a, b, dt_bias)
+            if fused_g_beta and compute_g_beta_prefill is not None:
+                g, beta = compute_g_beta_prefill(A_log, a, b, dt_bias)
             else:
-                g, beta = gd._compute_g_beta(A_log, a, b, dt_bias)
+                g, beta = _compute_g_beta(A_log, a, b, dt_bias)
             return fast_prefill(q, k, v, g, beta, state)
         return original(
             q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=use_kernel
