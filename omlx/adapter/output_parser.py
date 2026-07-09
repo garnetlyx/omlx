@@ -167,6 +167,9 @@ _DEEPSEEK_V4_TOOL_CALL_END = "</｜DSML｜tool_calls>"
 
 _HY3_TOOL_CALL_START = "<tool_calls:opensource>"
 _HY3_TOOL_CALL_END = "</tool_calls:opensource>"
+# Hy3 chat template: HYTK=':opensource' → <think:opensource>...</think:opensource>
+_HY3_THINK_START = "<think:opensource>"
+_HY3_THINK_END = "</think:opensource>"
 
 
 def _is_deepseek_v4_model(
@@ -886,6 +889,8 @@ def detect_output_parser(
                 model_path=model_name,
             ),
             stop_token_ids=set(),
+            thinking_start_text=_HY3_THINK_START,
+            thinking_end_text=_HY3_THINK_END,
             protocol_marker_texts=(
                 _HY3_TOOL_CALL_START,
                 _HY3_TOOL_CALL_END,
