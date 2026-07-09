@@ -153,7 +153,11 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
-from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
+from .api.thinking import (
+    ThinkingParser,
+    extract_thinking,
+    prompt_opens_thinking,
+)
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
@@ -4254,18 +4258,31 @@ async def stream_chat_completion(
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
     start_in_thinking = False
+    open_tag, close_tag = getattr(engine, "thinking_tags", (None, None))
+    recover_to_content = getattr(engine, "recover_reasoning_to_content", True)
     try:
         tokenizer = getattr(engine, "tokenizer", None)
         if tokenizer is not None:
             prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
                 engine, messages, kwargs
             )
+            po_kwargs: dict = {"prompt_token_ids": prompt_token_ids}
+            if open_tag:
+                po_kwargs["open_tag"] = open_tag
             start_in_thinking, _ = prompt_opens_thinking(
-                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+                tokenizer, prompt, **po_kwargs
             )
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    tp_kwargs: dict = {
+        "start_in_thinking": start_in_thinking,
+        "recover_malformed_to_content": recover_to_content,
+    }
+    if open_tag:
+        tp_kwargs["open_tag"] = open_tag
+    if close_tag:
+        tp_kwargs["close_tag"] = close_tag
+    thinking_parser = ThinkingParser(**tp_kwargs)
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
@@ -4659,18 +4676,31 @@ async def stream_anthropic_messages(
     # thinking block in the prompt itself, so the generated text starts with
     # reasoning body and only later emits </think>.
     start_in_thinking = False
+    open_tag, close_tag = getattr(engine, "thinking_tags", (None, None))
+    recover_to_content = getattr(engine, "recover_reasoning_to_content", True)
     try:
         tokenizer = getattr(engine, "tokenizer", None)
         if tokenizer is not None:
             prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
                 engine, messages, kwargs
             )
+            po_kwargs: dict = {"prompt_token_ids": prompt_token_ids}
+            if open_tag:
+                po_kwargs["open_tag"] = open_tag
             start_in_thinking, _ = prompt_opens_thinking(
-                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+                tokenizer, prompt, **po_kwargs
             )
     except Exception as exc:
         logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    tp_kwargs: dict = {
+        "start_in_thinking": start_in_thinking,
+        "recover_malformed_to_content": recover_to_content,
+    }
+    if open_tag:
+        tp_kwargs["open_tag"] = open_tag
+    if close_tag:
+        tp_kwargs["close_tag"] = close_tag
+    thinking_parser = ThinkingParser(**tp_kwargs)
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -5935,7 +5965,17 @@ async def stream_responses_api(
     accumulated_text = ""
     accumulated_reasoning = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser(start_in_thinking=native_reasoning)
+    open_tag, close_tag = getattr(engine, "thinking_tags", (None, None))
+    recover_to_content = getattr(engine, "recover_reasoning_to_content", True)
+    tp_kwargs: dict = {
+        "start_in_thinking": native_reasoning,
+        "recover_malformed_to_content": recover_to_content,
+    }
+    if open_tag:
+        tp_kwargs["open_tag"] = open_tag
+    if close_tag:
+        tp_kwargs["close_tag"] = close_tag
+    thinking_parser = ThinkingParser(**tp_kwargs)
     seq = 0
 
     response_id = generate_id(IDPrefix.RESPONSE)
