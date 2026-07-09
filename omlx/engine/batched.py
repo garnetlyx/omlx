@@ -111,6 +111,29 @@ class BatchedEngine(BaseEngine):
         return self._tokenizer
 
     @property
+    def thinking_tags(self) -> tuple[str | None, str | None]:
+        factory = getattr(
+            getattr(self._engine, "engine", None), "scheduler", None
+        )
+        factory = getattr(factory, "_output_parser_factory", None)
+        if factory is None:
+            return (None, None)
+        return (factory.thinking_start_text, factory.thinking_end_text)
+
+    @property
+    def recover_reasoning_to_content(self) -> bool:
+        # When a model ships a dedicated thinking-block parser (Hy3,
+        # MiniMax-M3, …) the stream already carries the chain of thought
+        # as ``reasoning_content``. Re-emitting it into the answer body
+        # (ThinkingParser.finish() legacy fallback) would duplicate the
+        # reasoning and pollute the visible answer — the exact failure
+        # mode reported for Hy3 when max_tokens truncates the chain
+        # before the model closes its ``</think:opensource>`` tag. So
+        # opt out whenever the engine has any thinking-tag pair.
+        open_tag, _ = self.thinking_tags
+        return open_tag is None
+
+    @property
     def model_type(self) -> str | None:
         """Get the model type from config (e.g., 'gpt_oss', 'llama', 'qwen2')."""
         if self._model is None:

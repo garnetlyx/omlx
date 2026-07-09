@@ -114,6 +114,30 @@ class BaseEngine(ABC):
         """Get the tokenizer."""
         pass
 
+    @property
+    def thinking_tags(self) -> tuple[str | None, str | None]:
+        """Per-model (open_tag, close_tag) sentinels for reasoning blocks.
+
+        Returns (None, None) when no model-specific parser is wired up;
+        callers fall back to the model-family default (``馀`` /
+        ``馀``). Engines with an OutputParserFactory expose the factory's
+        thinking_start_text / thinking_end_text here.
+        """
+        return (None, None)
+
+    @property
+    def recover_reasoning_to_content(self) -> bool:
+        """Whether ThinkingParser.finish() may re-emit truncated thinking as content.
+
+        True (default) preserves the legacy behavior re-emitting an
+        unterminated thinking block as content so clients without a
+        reasoning panel still see a non-empty answer. False is opted
+        into by engines that stream reasoning to a dedicated
+        ``reasoning_content`` field, where duplicating it into the
+        answer body would pollute the visible content.
+        """
+        return True
+
     @abstractmethod
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
