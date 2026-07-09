@@ -74,17 +74,17 @@ def _encode_prompt_ids(tokenizer, prompt: str) -> list[int] | None:
         return None
 
 
-def _think_end_token_ids(tokenizer) -> list[int] | None:
+def _think_end_token_ids(tokenizer, close_tag: str = _CLOSE_TAG) -> list[int] | None:
     think_end_id = _single_token_id(_safe_tokenizer_attr(tokenizer, "think_end_id"))
     if think_end_id is not None:
         return [think_end_id]
 
-    think_end_tag = _safe_tokenizer_attr(tokenizer, "think_end", _CLOSE_TAG)
-    encoded = _encode_prompt_ids(tokenizer, think_end_tag or _CLOSE_TAG)
+    think_end_tag = _safe_tokenizer_attr(tokenizer, "think_end", close_tag)
+    encoded = _encode_prompt_ids(tokenizer, think_end_tag or close_tag)
     if encoded:
         return encoded
 
-    token_id = _convert_token_to_id(tokenizer, _CLOSE_TAG)
+    token_id = _convert_token_to_id(tokenizer, close_tag)
     if token_id is not None:
         return [token_id]
     return None
@@ -94,18 +94,20 @@ def prompt_opens_thinking(
     tokenizer,
     prompt: str,
     prompt_token_ids: Sequence[int] | None = None,
+    *,
+    open_tag: str = _OPEN_TAG,
 ) -> tuple[bool, str]:
-    """Return whether a raw prompt would make the engine prepend ``<think>``.
+    """Return whether a raw prompt would make the engine prepend the think-open tag.
 
     Presentation-layer stripping must mirror the engine/scheduler decision, not
-    just the raw text suffix. Some prompts can contain a literal ``<think>``
+    just the raw text suffix. Some prompts can contain a literal think-open tag
     without tokenizing to the model's think-start id, and templates can leave
     the think-start token in the final token tail without the raw string ending
     in the visible tag. When the caller already has prompt ids from the same
     tokenizer path as the scheduler, those ids are authoritative.
     """
     think_tag = (
-        _safe_tokenizer_attr(tokenizer, "think_start", _OPEN_TAG) or _OPEN_TAG
+        _safe_tokenizer_attr(tokenizer, "think_start", open_tag) or open_tag
     )
     if tokenizer is None:
         return prompt.rstrip().endswith(think_tag), think_tag
@@ -140,18 +142,23 @@ def prompt_opens_thinking(
     return True, think_tag
 
 
-def extract_thinking(text: str) -> Tuple[str, str]:
+def extract_thinking(
+    text: str,
+    *,
+    open_tag: str = _OPEN_TAG,
+    close_tag: str = _CLOSE_TAG,
+) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
     Handles:
-    - Normal: ``<think>reasoning</think>answer`` → ``("reasoning", "answer")``
+    - Normal: ``馀reasoning馀answer`` → ``("reasoning", "answer")``
     - No thinking: ``just answer`` → ``("", "just answer")``
-    - Partial (no open tag): ``reasoning</think>answer`` → ``("reasoning", "answer")``
-    - Empty think: ``<think></think>answer`` → ``("", "answer")``
-    - Think only: ``<think>reasoning</think>`` → ``("reasoning", "")``
-    - Malformed (open with no close): ``<think>everything…`` →
+    - Partial (no open tag): ``reasoning馀answer`` → ``("reasoning", "answer")``
+    - Empty think: ``馀馀answer`` → ``("", "answer")``
+    - Think only: ``馀reasoning馀`` → ``("reasoning", "")``
+    - Malformed (open with no close): ``馀everything…`` →
       ``("", "everything…")`` — recovery for V4-style models that
-      occasionally skip the ``</think>`` boundary token. Without this
+      occasionally skip the ``馀`` boundary token. Without this
       fallback the entire body would be classified as thinking and the
       visible answer would be empty.
 
@@ -162,6 +169,8 @@ def extract_thinking(text: str) -> Tuple[str, str]:
 
     Args:
         text: Complete model output text.
+        open_tag: Opening sentinel of the thinking block.
+        close_tag: Closing sentinel of the thinking block.
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -169,16 +178,21 @@ def extract_thinking(text: str) -> Tuple[str, str]:
     if not text:
         return ("", "")
 
-    text = text.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG).replace(
-        _MINIMAX_CLOSE_TAG, _CLOSE_TAG
+    text = text.replace(_MINIMAX_OPEN_TAG, open_tag).replace(
+        _MINIMAX_CLOSE_TAG, close_tag
     )
+
+    open_re = re.escape(open_tag)
+    close_re = re.escape(close_tag)
+    pattern = re.compile(rf'{open_re}(.*?){close_re}', re.DOTALL)
+    tail_pattern = re.compile(rf'^(.*?){close_re}', re.DOTALL)
+    open_len = len(open_tag)
 
     thinking_parts = []
     remaining = text
 
-    # Extract all <think>...</think> blocks
     while True:
-        match = _THINKING_PATTERN.search(remaining)
+        match = pattern.search(remaining)
         if not match:
             break
         thinking_parts.append(match.group(1))
@@ -188,20 +202,17 @@ def extract_thinking(text: str) -> Tuple[str, str]:
         thinking = "\n".join(thinking_parts).strip()
         return (thinking, remaining.strip())
 
-    # Handle partial: content before </think> without <think> tag
-    if '</think>' in text and '<think>' not in text:
-        match = _THINKING_TAIL_PATTERN.match(text)
+    if close_tag in text and open_tag not in text:
+        match = tail_pattern.match(text)
         if match:
             thinking = match.group(1).strip()
             remaining = text[match.end():].strip()
             return (thinking, remaining)
 
-    # Malformed: <think> opened but never closed. Drop the open tag and
-    # treat the remainder as content so the answer body is not empty.
-    if '<think>' in text and '</think>' not in text:
-        idx = text.index('<think>')
+    if open_tag in text and close_tag not in text:
+        idx = text.index(open_tag)
         before = text[:idx]
-        after = text[idx + _OPEN_LEN:]
+        after = text[idx + open_len:]
         return ("", (before + after).strip())
 
     return ("", text)
@@ -229,11 +240,35 @@ class ThinkingParser:
         t, c = parser.finish()
     """
 
-    def __init__(self, start_in_thinking: bool = False):
+    def __init__(
+        self,
+        start_in_thinking: bool = False,
+        *,
+        open_tag: str = _OPEN_TAG,
+        close_tag: str = _CLOSE_TAG,
+        recover_malformed_to_content: bool = True,
+    ):
         self._in_thinking: bool = start_in_thinking
         self._buffer: str = ""  # Buffer for potential partial tags
+        # Configurable thinking-block sentinels. Most reasoning models use
+        # ``馀``/``馀``, but some (e.g. Tencent Hy3) use
+        # ``<think:opensource>``/``</think:opensource>``. Per-instance
+        # configuration avoids claiming a global convention.
+        self._open_tag: str = open_tag
+        self._close_tag: str = close_tag
+        self._open_len: int = len(open_tag)
+        self._close_len: int = len(close_tag)
+        # When True (default, legacy behavior), finish() re-emits the
+        # accumulated thinking as content if the model never closed its
+        # thinking block — used so clients that do not surface a reasoning
+        # panel still get a non-empty answer body. When False (modern
+        # reasoning-content clients, e.g. Hy3 via OpenAI Chat Completions),
+        # the stream already carried the reasoning as a dedicated
+        # ``reasoning_content`` field, so duplicating it as content only
+        # pollutes the answer panel.
+        self._recover_to_content: bool = recover_malformed_to_content
         # Recovery state for malformed thinking: when the prompt prepends
-        # ``<think>`` and the model never emits ``</think>`` before EOS,
+        # ``馀`` and the model never emits ``馀`` before EOS,
         # everything we streamed went out as thinking. The streamed events
         # cannot be retracted, so finish() emits the accumulated thinking
         # text once more as content — the client will show both panels but
@@ -261,42 +296,41 @@ class ThinkingParser:
         thinking_out = []
         content_out = []
 
+        open_first = self._open_tag[0]
+        close_first = self._close_tag[0]
+        tag_firsts = {open_first, close_first}
+
         i = 0
         while i < len(text):
-            if text[i] == '<':
-                # Check if this could be a tag start
+            ch = text[i]
+            if ch in tag_firsts:
                 remaining = text[i:]
 
-                # Try to match <think>
-                if remaining.startswith(_OPEN_TAG):
+                if remaining.startswith(self._open_tag):
                     self._in_thinking = True
-                    i += _OPEN_LEN
+                    i += self._open_len
                     continue
 
-                # Try to match </think>
-                if remaining.startswith(_CLOSE_TAG):
+                if remaining.startswith(self._close_tag):
                     self._in_thinking = False
                     self._close_seen = True
-                    i += _CLOSE_LEN
+                    i += self._close_len
                     continue
 
-                # Check if it could be a partial tag (not enough chars yet)
                 if self._could_be_tag(remaining):
-                    # Buffer the rest and wait for more data
                     self._buffer = remaining
                     break
 
-                # Not a tag, emit the '<' as regular content
                 if self._in_thinking:
-                    thinking_out.append('<')
+                    thinking_out.append(ch)
                 else:
-                    content_out.append('<')
+                    content_out.append(ch)
                 i += 1
             else:
                 if self._in_thinking:
-                    thinking_out.append(text[i])
+                    thinking_out.append(ch)
                 else:
-                    content_out.append(text[i])
+                    content_out.append(ch)
                 i += 1
 
         thinking_delta = "".join(thinking_out)
@@ -324,15 +358,25 @@ class ThinkingParser:
         partial = self._buffer
         self._buffer = ""
 
-        # Recovery: prompt opened a thinking block (or model echoed
-        # ``<think>`` itself), the close tag never arrived, and nothing
+# Recovery: prompt opened a thinking block (or model echoed
+        # ``馀`` itself), the close tag never arrived, and nothing
         # ever streamed as content. Re-emit the accumulated thinking text
         # as content so the answer body is not empty. The thinking events
         # already streamed live cannot be retracted, so the client sees
         # the same text twice — once in the thinking panel, once as the
         # answer. UX trade-off documented in the chat template plan.
+        #
+        # Skipped when ``recover_malformed_to_content=False``: the stream
+        # is already carrying the reasoning to a dedicated
+        # ``reasoning_content`` panel, so duplicating it into the answer
+        # body would only pollute the visible content (the failure mode
+        # observed for Hy3 when the thinking chain is truncated by
+        # max_tokens before the model closes its ``</think:opensource>``
+        # tag). Leaving content empty signals the client to surface the
+        # reasoning panel as the response.
         if (
-            self._in_thinking
+            self._recover_to_content
+            and self._in_thinking
             and not self._close_seen
             and not self._content_emitted
             and self._thinking_accumulated
@@ -352,17 +396,16 @@ class ThinkingParser:
             self._content_emitted = True
             return ("", partial)
 
-    @staticmethod
-    def _could_be_tag(text: str) -> bool:
-        """Check if text could be the start of a <think> or </think> tag.
-
-        Returns True if text is a proper prefix of either tag but not
-        yet a complete match.
-        """
+    def _could_be_tag(self, text: str) -> bool:
         length = len(text)
-        if length >= _CLOSE_LEN:
-            # Long enough to determine - not a partial tag
+        max_len = max(self._open_len, self._close_len)
+        if length >= max_len:
             return False
+        if self._open_tag[:length] == text:
+            return True
+        if self._close_tag[:length] == text:
+            return True
+        return False
 
         # Check against both tags
         if _OPEN_TAG[:length] == text:
