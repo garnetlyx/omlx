@@ -4452,15 +4452,65 @@ _ds4_sidecar_cache: dict[str, Any] | None = None
 _ds4_sidecar_cache_time: float = 0.0
 _ds4_sidecar_lock = asyncio.Lock()
 
-# DS4's native /v1/models IDs (deepseek-v4-flash/-pro) collide with the remote
-# DeepSeek provider catalog, so they are NOT valid sidecar chat models: calling
-# them through Sub2API can schedule to a remote account. The local quantized
-# GGUF is published by Sub2API under this derived public alias. The dashboard
-# chat MUST target this alias, never the bare internal ID.
-_DS4_PUBLIC_CHAT_ALIAS = "Deepseek-V4-Flash-q2-imatrix"
+# DS4's native /v1/models IDs can collide with remote catalogs; the chat MUST
+# target the public alias derived from DS4_MODEL_PATH (mirrors init-sub2api.sh).
 _ds4_public_models_cache: list[str] | None = None
 _ds4_public_models_cache_time: float = 0.0
 _ds4_public_models_lock = asyncio.Lock()
+
+
+def _ds4_public_alias(stats: dict[str, Any] | None = None) -> str:
+    model_path = os.getenv("DS4_MODEL_PATH", "")
+    suffix_override = os.getenv("DS4_PUBLIC_MODEL_SUFFIX", "").strip("-").strip()
+
+    if stats is None:
+        stats = _ds4_sidecar_cache
+    models: list[str] = []
+    if isinstance(stats, dict):
+        raw = stats.get("models")
+        if isinstance(raw, list):
+            models = [str(m) for m in raw if m]
+    if not models:
+        return ""
+
+    selected = models[0]
+    fname = os.path.basename(model_path).lower() if model_path else ""
+    if "flash" in fname:
+        for name in models:
+            if "flash" in name.lower():
+                selected = name
+                break
+    elif "pro" in fname:
+        for name in models:
+            if "pro" in name.lower():
+                selected = name
+                break
+
+    if suffix_override:
+        suffix = suffix_override
+    else:
+        name_lower = fname
+        quant = ""
+        if "iq2" in name_lower or "q2" in name_lower or "2bit" in name_lower or "2-bit" in name_lower:
+            quant = "q2"
+        elif "iq3" in name_lower or "q3" in name_lower or "3bit" in name_lower or "3-bit" in name_lower:
+            quant = "q3"
+        elif "iq4" in name_lower or "q4" in name_lower or "4bit" in name_lower or "4-bit" in name_lower:
+            quant = "q4"
+        elif "q8" in name_lower or "8bit" in name_lower or "8-bit" in name_lower:
+            quant = "q8"
+        tags = [quant] if quant else []
+        if "imatrix" in name_lower:
+            tags.append("imatrix")
+        suffix = "-".join(tags)
+
+    words = [p for p in selected.replace("_", "-").split("-") if p]
+    public_base = "-".join(
+        p.upper() if p.lower() in {"v3", "v4"} else p.capitalize() for p in words
+    )
+    if not suffix:
+        return public_base
+    return f"{public_base}-{suffix}"
 
 
 def _ds4_ctx() -> int | None:
@@ -4650,6 +4700,11 @@ async def _fetch_ds4_sidecar_stats() -> dict[str, Any]:
 
 
 def _fetch_ds4_public_chat_models_blocking(base_url: str, api_key: str) -> list[str]:
+    sidecar_stats = _fetch_ds4_sidecar_stats_blocking()
+    expected = _ds4_public_alias(sidecar_stats)
+    if not expected:
+        return []
+
     try:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         resp = requests.get(
@@ -4663,17 +4718,17 @@ def _fetch_ds4_public_chat_models_blocking(base_url: str, api_key: str) -> list[
                 for m in resp.json().get("data", [])
                 if isinstance(m, dict) and m.get("id")
             }
-            if _DS4_PUBLIC_CHAT_ALIAS not in ids:
+            if expected not in ids:
                 logger.warning(
                     "Sub2API catalog missing DS4 public alias %s; "
                     "returning it as conservative fallback",
-                    _DS4_PUBLIC_CHAT_ALIAS,
+                    expected,
                 )
-        else:
-            logger.debug("Sub2API /models returned %s", resp.status_code)
+            return [expected]
+        logger.debug("Sub2API /models returned %s", resp.status_code)
     except Exception as exc:
         logger.debug("Sub2API catalog lookup failed: %s", exc)
-    return [_DS4_PUBLIC_CHAT_ALIAS]
+    return [expected]
 
 
 async def _resolve_ds4_public_chat_models(base_url: str, api_key: str) -> list[str]:
@@ -4689,7 +4744,8 @@ async def _resolve_ds4_public_chat_models(base_url: str, api_key: str) -> list[s
     if _ds4_public_models_lock.locked():
         if _ds4_public_models_cache is not None:
             return _ds4_public_models_cache
-        return [_DS4_PUBLIC_CHAT_ALIAS]
+        fallback = _ds4_public_alias()
+        return [fallback] if fallback else []
 
     async with _ds4_public_models_lock:
         now = time.time()
@@ -4704,7 +4760,8 @@ async def _resolve_ds4_public_chat_models(base_url: str, api_key: str) -> list[s
             )
         except Exception as exc:
             logger.debug("Sub2API catalog resolve failed: %s", exc)
-            result = [_DS4_PUBLIC_CHAT_ALIAS]
+            fallback = _ds4_public_alias()
+            result = [fallback] if fallback else []
         _ds4_public_models_cache = result
         _ds4_public_models_cache_time = time.time()
         return result
