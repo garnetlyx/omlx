@@ -1536,7 +1536,7 @@ class ProcessMemoryEnforcer:
                         await self._engine_pool._unload_engine(
                             victim,
                             reason="process_memory_enforcer",
-                            source=f"active={_format_gb(mx.get_active_memory())} limit={_format_gb(self._max_bytes)}",
+                            source=f"active={_format_gb(mx.get_active_memory())} limit={_format_gb(self.get_final_ceiling())}",
                         )
                         continue
 
