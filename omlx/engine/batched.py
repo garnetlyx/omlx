@@ -18,6 +18,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
 
@@ -85,19 +86,16 @@ class BatchedEngine(BaseEngine):
         num_prompt_tokens: int,
         request_id: str | None,
     ) -> None:
-        eviction_request = scheduler.preflight_eviction_request(
+        await _run_scheduler_preflight_with_cleanup_retry(
+            scheduler,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
-        )
-        if eviction_request is not None and self._prefill_eviction_callback is not None:
-            logger.info(
-                "Running preflight LRU eviction for request %s",
-                eviction_request.request_id,
-            )
-            await self._prefill_eviction_callback(eviction_request)
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_prompt_tokens,
-            request_id=request_id,
+            eviction_callback=self._prefill_eviction_callback,
+            executor=getattr(
+                getattr(getattr(self, "_engine", None), "engine", None),
+                "_mlx_executor",
+                None,
+            ),
         )
 
     @property
@@ -738,10 +736,12 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: forward per-request overrides to the engine, mirroring
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            tools=tools,
             **specprefill_kwargs,
         )
 
@@ -812,11 +812,13 @@ class BatchedEngine(BaseEngine):
 
         # SpecPrefill: pass per-request overrides to engine
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         engine = self._engine
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             **specprefill_kwargs,
         )
@@ -926,6 +928,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            tools=tools,
             **kwargs,
         )
 
@@ -1082,6 +1085,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            tools=tools,
             **kwargs,
         ):
             yield output

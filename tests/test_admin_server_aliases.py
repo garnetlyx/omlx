@@ -342,7 +342,7 @@ class TestUpdateGlobalSettingsAliases:
 
         with _patched_global_settings(gs):
             result = asyncio.run(
-                admin_routes.update_global_settings(request=request, is_admin=True)
+                admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
             )
 
         assert result["success"] is True
@@ -358,7 +358,7 @@ class TestUpdateGlobalSettingsAliases:
 
         with _patched_global_settings(gs):
             asyncio.run(
-                admin_routes.update_global_settings(request=request, is_admin=True)
+                admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
             )
 
         assert gs.server.server_aliases == ["foo.local", "10.0.0.5"]
@@ -372,7 +372,7 @@ class TestUpdateGlobalSettingsAliases:
         with _patched_global_settings(gs):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
-                    admin_routes.update_global_settings(request=request, is_admin=True)
+                    admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
                 )
 
         assert exc_info.value.status_code == 400
@@ -387,7 +387,7 @@ class TestUpdateGlobalSettingsAliases:
         with _patched_global_settings(gs):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
-                    admin_routes.update_global_settings(request=request, is_admin=True)
+                    admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
                 )
 
         assert exc_info.value.status_code == 400
@@ -401,7 +401,7 @@ class TestUpdateGlobalSettingsAliases:
         with _patched_global_settings(gs):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
-                    admin_routes.update_global_settings(request=request, is_admin=True)
+                    admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
                 )
 
         assert exc_info.value.status_code == 400
@@ -412,7 +412,7 @@ class TestUpdateGlobalSettingsAliases:
 
         with _patched_global_settings(gs):
             asyncio.run(
-                admin_routes.update_global_settings(request=request, is_admin=True)
+                admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
             )
 
         assert gs.server.server_aliases == ["::1"]
@@ -423,7 +423,7 @@ class TestUpdateGlobalSettingsAliases:
 
         with _patched_global_settings(gs):
             asyncio.run(
-                admin_routes.update_global_settings(request=request, is_admin=True)
+                admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
             )
 
         assert gs.server.server_aliases == []
@@ -441,7 +441,7 @@ class TestUpdateGlobalSettingsHotCache:
         with _patched_global_settings(gs):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
-                    admin_routes.update_global_settings(request=request, is_admin=True)
+                    admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
                 )
 
         assert exc_info.value.status_code == 400
@@ -461,7 +461,7 @@ class TestUpdateGlobalSettingsMidSystemCache:
 
         with _patched_global_settings(gs):
             result = asyncio.run(
-                admin_routes.update_global_settings(request=request, is_admin=True)
+                admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
             )
 
         assert result["success"] is True
@@ -502,7 +502,7 @@ class TestUpdateGlobalSettingsSampling:
             ),
         ):
             result = asyncio.run(
-                admin_routes.update_global_settings(request=request, is_admin=True)
+                admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
             )
 
         assert result["success"] is True
@@ -530,7 +530,7 @@ class TestUpdateGlobalSettingsSampling:
             ),
         ):
             result = asyncio.run(
-                admin_routes.update_global_settings(request=request, is_admin=True)
+                admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
             )
 
         assert "sampling_max_context_window_policy" in request.model_fields_set
@@ -570,7 +570,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
             ),
         ):
             result = asyncio.run(
-                admin_routes.update_global_settings(request=request, is_admin=True)
+                admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
             )
 
         assert result["success"] is True
@@ -589,7 +589,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         with _patched_global_settings(gs):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
-                    admin_routes.update_global_settings(request=request, is_admin=True)
+                    admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
                 )
 
         assert exc_info.value.status_code == 400
@@ -615,7 +615,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         ):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
-                    admin_routes.update_global_settings(request=request, is_admin=True)
+                    admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
                 )
 
         assert exc_info.value.status_code == 400
@@ -642,7 +642,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         ):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
-                    admin_routes.update_global_settings(request=request, is_admin=True)
+                    admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
                 )
 
         assert exc_info.value.status_code == 400
@@ -669,7 +669,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         ):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
-                    admin_routes.update_global_settings(request=request, is_admin=True)
+                    admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
                 )
 
         assert exc_info.value.status_code == 500

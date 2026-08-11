@@ -28,7 +28,7 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
@@ -37,6 +37,8 @@ from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
+from ..websearch import DDGS_TEXT_BACKENDS, run_web_search_test
+from ..websearch import SUPPORTED_PROVIDERS as SUPPORTED_WEB_SEARCH_PROVIDERS
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -304,16 +306,33 @@ class GlobalSettingsRequest(BaseModel):
     markitdown_max_file_size_mb: int | None = None
     markitdown_max_files_per_request: int | None = None
     markitdown_pdf_processing_engine: str | None = None
+    web_search_provider: str | None = None
+    web_search_brave_api_key: str | None = None
+    web_search_searxng_url: str | None = None
+    web_search_ddgs_backends: str | None = None
+    web_search_max_results: int | None = None
+    web_search_content_mode: str | None = None
+    web_search_content_truncate: bool | None = None
+    web_search_content_max_chars: int | None = None
 
     # UI settings
     ui_language: str | None = None
 
-    # Idle timeout settings. null disables the global fallback.
+    # Idle timeout settings. null/0/"" disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
 
     # Auth settings
     api_key: str | None = None
     skip_api_key_verification: bool | None = None
+
+    @field_validator("idle_timeout_seconds", mode="before")
+    @classmethod
+    def _normalize_idle_timeout(cls, v):
+        if v == "":
+            return None
+        if isinstance(v, int) and not isinstance(v, bool) and v == 0:
+            return None
+        return v
 
 
 class HFDownloadRequest(BaseModel):
@@ -662,6 +681,15 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
             "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa)"
         )
     if not _checkpoint_has_mtp_weights(model_path):
+        from ..oq import _resolve_mtplx_sidecar
+
+        if _resolve_mtplx_sidecar(Path(model_path), cfg) is not None:
+            # The dashboard keys the one-click import button off this
+            # "MTPLX side-car" marker (models.js).
+            return False, (
+                "MTPLX side-car detected but not imported. Import it to "
+                "merge the MTP head into the checkpoint index."
+            )
         return False, (
             "Config declares MTP layers but the weight files contain neither "
             "mtp.* tensors nor native nextn layers. Re-convert from HF with a "
@@ -2081,6 +2109,32 @@ async def load_model(
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
 
+@router.post("/api/models/{model_id}/import-mtplx")
+async def import_mtplx(
+    model_id: str,
+    is_admin: bool = Depends(_require_admin_or_bearer),
+):
+    """Import an MTPLX side-car MTP head into the model's checkpoint index."""
+    from ..oq import import_mtplx_sidecar
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    try:
+        result = await asyncio.to_thread(import_mtplx_sidecar, entry.model_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    logger.info(f"Imported MTPLX side-car for model: {model_id}")
+    if entry.engine is not None:
+        result["message"] = "Imported. Reload the model to activate the MTP head."
+    return {"status": "ok", "model_id": model_id, **result}
+
+
 @router.post("/api/reload")
 async def reload_models(
     request: Request,
@@ -2136,6 +2190,9 @@ async def update_model_settings(
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
     prev_engine_type = entry.engine_type  # Track for requires_reload check
+    prev_load_signature = engine_pool._engine_runtime_signature(
+        model_id, current_settings
+    )
     is_diffusion_model = _entry_is_diffusion_model(entry)
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
@@ -2565,6 +2622,23 @@ async def update_model_settings(
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
+
+    # A failed load is cached to prevent clients from retrying the same broken
+    # configuration on every request. Clear that cache only when the effective
+    # load-time configuration changed so the next request can try the new
+    # configuration without requiring a full model rescan.
+    current_load_signature = engine_pool._engine_runtime_signature(
+        model_id, current_settings
+    )
+    if entry.load_failed and (
+        prev_engine_type != entry.engine_type
+        or prev_load_signature != current_load_signature
+    ):
+        engine_pool._clear_load_failure(entry)
+        logger.info(
+            "Cleared cached load failure for %s after load-time settings changed.",
+            model_id,
+        )
 
     # Auto-unload (and re-load if pinned) when a setting that only takes
     # effect at engine construction time is changed on a loaded model.
@@ -3293,6 +3367,14 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "markitdown_max_file_size_mb": global_settings.integrations.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": global_settings.integrations.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": global_settings.integrations.markitdown_pdf_processing_engine,
+            "web_search_provider": global_settings.integrations.web_search_provider,
+            "web_search_brave_api_key": global_settings.integrations.web_search_brave_api_key,
+            "web_search_searxng_url": global_settings.integrations.web_search_searxng_url,
+            "web_search_ddgs_backends": global_settings.integrations.web_search_ddgs_backends,
+            "web_search_max_results": global_settings.integrations.web_search_max_results,
+            "web_search_content_mode": global_settings.integrations.web_search_content_mode,
+            "web_search_content_truncate": global_settings.integrations.web_search_content_truncate,
+            "web_search_content_max_chars": global_settings.integrations.web_search_content_max_chars,
         },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
@@ -3885,6 +3967,90 @@ async def update_global_settings(
             )
         global_settings.integrations.markitdown_pdf_processing_engine = engine
         integrations_changed = True
+    if "web_search_provider" in request.model_fields_set:
+        provider = (request.web_search_provider or "").strip().lower()
+        if provider not in SUPPORTED_WEB_SEARCH_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "web_search_provider must be one of: "
+                    + ", ".join(SUPPORTED_WEB_SEARCH_PROVIDERS)
+                ),
+            )
+        global_settings.integrations.web_search_provider = provider
+        integrations_changed = True
+    if "web_search_brave_api_key" in request.model_fields_set:
+        global_settings.integrations.web_search_brave_api_key = (
+            request.web_search_brave_api_key or ""
+        ).strip()
+        integrations_changed = True
+    if "web_search_searxng_url" in request.model_fields_set:
+        searxng_url = (request.web_search_searxng_url or "").strip().rstrip("/")
+        if searxng_url and not searxng_url.startswith(("http://", "https://")):
+            raise HTTPException(
+                status_code=400,
+                detail="web_search_searxng_url must start with http:// or https://",
+            )
+        global_settings.integrations.web_search_searxng_url = searxng_url
+        integrations_changed = True
+    if "web_search_ddgs_backends" in request.model_fields_set:
+        raw_backends = request.web_search_ddgs_backends or ""
+        requested = [
+            b.strip().lower() for b in raw_backends.split(",") if b.strip()
+        ]
+        unknown = [b for b in requested if b not in DDGS_TEXT_BACKENDS]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "web_search_ddgs_backends contains unknown engines: "
+                    + ", ".join(unknown)
+                ),
+            )
+        global_settings.integrations.web_search_ddgs_backends = ",".join(
+            dict.fromkeys(requested)
+        )
+        integrations_changed = True
+    if "web_search_max_results" in request.model_fields_set:
+        if (
+            request.web_search_max_results is None
+            or not 1 <= request.web_search_max_results <= 10
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="web_search_max_results must be between 1 and 10",
+            )
+        global_settings.integrations.web_search_max_results = (
+            request.web_search_max_results
+        )
+        integrations_changed = True
+    if "web_search_content_mode" in request.model_fields_set:
+        content_mode = (request.web_search_content_mode or "").strip().lower()
+        if content_mode not in ("snippet", "full"):
+            raise HTTPException(
+                status_code=400,
+                detail="web_search_content_mode must be snippet or full",
+            )
+        global_settings.integrations.web_search_content_mode = content_mode
+        integrations_changed = True
+    if "web_search_content_truncate" in request.model_fields_set:
+        global_settings.integrations.web_search_content_truncate = bool(
+            request.web_search_content_truncate
+        )
+        integrations_changed = True
+    if "web_search_content_max_chars" in request.model_fields_set:
+        if (
+            request.web_search_content_max_chars is None
+            or request.web_search_content_max_chars <= 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="web_search_content_max_chars must be > 0",
+            )
+        global_settings.integrations.web_search_content_max_chars = (
+            request.web_search_content_max_chars
+        )
+        integrations_changed = True
 
     if integrations_changed:
         runtime_applied.append("integrations")
@@ -3898,7 +4064,8 @@ async def update_global_settings(
             f"pi={global_settings.integrations.pi_model}, "
             f"markitdown_enabled={global_settings.integrations.markitdown_enabled}, "
             f"markitdown_expose_model={global_settings.integrations.markitdown_expose_model}, "
-            f"markitdown_pdf_processing_engine={global_settings.integrations.markitdown_pdf_processing_engine}"
+            f"markitdown_pdf_processing_engine={global_settings.integrations.markitdown_pdf_processing_engine}, "
+            f"web_search_provider={global_settings.integrations.web_search_provider}"
         )
 
     # Apply UI settings
@@ -3978,6 +4145,35 @@ async def update_global_settings(
         "message": message,
         "runtime_applied": runtime_applied,
     }
+
+
+class WebSearchTestRequest(BaseModel):
+    """Pending settings-form values to validate with one real search."""
+
+    provider: str = "ddgs"
+    brave_api_key: str = ""
+    searxng_url: str = ""
+    ddgs_backends: str = ""
+
+
+@router.post("/api/web-search/test")
+async def test_web_search(
+    request: WebSearchTestRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """
+    Run one real search with the pending (unsaved) web search settings.
+
+    Nothing is persisted here; saving stays with POST /api/global-settings.
+    Always answers HTTP 200 with an {"ok": bool, ...} payload so the UI
+    can show the provider's error message verbatim.
+    """
+    return await run_web_search_test(
+        request.provider,
+        brave_api_key=request.brave_api_key,
+        searxng_url=request.searxng_url,
+        ddgs_backends=request.ddgs_backends,
+    )
 
 
 # =============================================================================
@@ -4714,6 +4910,24 @@ def _build_active_models_data() -> dict:
         if is_loaded and effective_ttl is not None and idle_seconds is not None:
             ttl_remaining_seconds = max(0.0, effective_ttl - idle_seconds)
 
+        # DFlash observability (issue #2398): session speculation counters and
+        # the load-time precision pairing warning. None on non-DFlash engines.
+        dflash_info = None
+        if entry is not None and entry.engine is not None:
+            pairing = getattr(entry.engine, "pairing_warning", None)
+            speculation = None
+            get_speculation = getattr(entry.engine, "get_speculation_stats", None)
+            if callable(get_speculation):
+                try:
+                    speculation = get_speculation()
+                except Exception:
+                    logger.debug("get_speculation_stats failed", exc_info=True)
+            if speculation is not None or pairing:
+                dflash_info = {
+                    "speculation": speculation,
+                    "pairing_warning": pairing,
+                }
+
         models.append(
             {
                 "id": model_id,
@@ -4740,6 +4954,7 @@ def _build_active_models_data() -> dict:
                 "generating": generating,
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
+                "dflash": dflash_info,
             }
         )
 
@@ -6271,11 +6486,17 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
 
     run = get_active_run()
     if run is None:
-        return {"running": False, "bench_id": None, "model_id": None}
+        return {
+            "running": False,
+            "bench_id": None,
+            "model_id": None,
+            "context_profile": None,
+        }
     return {
         "running": True,
         "bench_id": run.bench_id,
         "model_id": run.request.model_id,
+        "context_profile": run.request.context_profile.value,
         "force_lm_engine": run.request.force_lm_engine,
         # Reconnecting tabs need this to restore the disabled-dropdown UI
         # state. Never expose base_url/api_key here — model_id already
@@ -6467,6 +6688,7 @@ async def get_benchmark_results(
     return {
         "bench_id": run.bench_id,
         "status": run.status,
+        "context_profile": run.request.context_profile.value,
         "results": run.results,
         "error": run.error_message if run.error_message else None,
         "upload_state": run.upload_state,

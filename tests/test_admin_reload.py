@@ -72,7 +72,7 @@ class TestReloadModels:
                     assert success is True
                     assert "5 models" in msg
                     settings_manager._load.assert_called_once()
-                    mock_apply.assert_called_once_with(["/path/to/models"])
+                    mock_apply.assert_called_once_with(["/path/to/models"], source=None)
                     pool.preload_pinned_models.assert_called_once()
         finally:
             _restore_mocks(originals)
@@ -178,7 +178,7 @@ class TestReloadModels:
                 ) as mock_apply:
                     success, msg = asyncio.run(admin_routes._reload_models())
                     assert success is True
-                    mock_apply.assert_called_once_with(["/fallback/path"])
+                    mock_apply.assert_called_once_with(["/fallback/path"], source=None)
         finally:
             _restore_mocks(originals)
 

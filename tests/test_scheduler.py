@@ -17,6 +17,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 
 import concurrent.futures
 import json
+import threading
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -25,22 +26,54 @@ import mlx.core as mx
 import pytest
 
 import omlx.scheduler as scheduler_module
+from omlx.cache.stats import PrefixCacheStats
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import (
     Scheduler,
     SchedulerConfig,
     SchedulerOutput,
     SchedulingPolicy,
+    _BoundarySnapshotProvider,
     _PrefillState,
+    _PreflightRejection,
     _StoreCacheGate,
     _VLMMTPDecodeState,
 )
+
+
+def test_boundary_snapshot_provider_removes_failed_promotion(tmp_path):
+    staged = tmp_path / "detached.safetensors"
+    staged.write_bytes(b"checkpoint")
+    store = MagicMock()
+    store.take_staged_file.return_value = staged
+    manager = MagicMock()
+    manager.cache_signature_for.return_value = "signature"
+    manager.commit_gdn_checkpoint_file.return_value = None
+    provider = _BoundarySnapshotProvider(
+        store,
+        "request",
+        [2048],
+        {},
+        paged_ssd_manager=manager,
+    )
+
+    assert not provider.commit_gdn_checkpoint(
+        2048,
+        b"source",
+        layer_cache_types=["ArraysCache"],
+        layer_meta_states=[()],
+        model_name="model",
+        block_size=2048,
+    )
+    assert not staged.exists()
 
 
 class _ParserStopFactory:
     kind = "test"
     stop_token_ids = set()
     thinking_end_text = None
+
+    create_session_with_tools = None
 
     def create_session(self, tokenizer):
         return _ParserStopSession()
@@ -770,14 +803,14 @@ class TestSchedulerAddRequest:
         """Prompts below the freshness minimum should never wait on store_cache."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.block_aware_cache = MagicMock()
-        prompt = list(range(7000))
+        prompt = list(range(4095))
 
         future = MagicMock()
         future.done.return_value = False
         future.result.return_value = None
         scheduler._inflight_store_futures["req-prev"] = future
         scheduler._inflight_store_info["req-prev"] = (
-            scheduler_module._InflightStoreInfo(tokens=list(range(6000)))
+            scheduler_module._InflightStoreInfo(tokens=list(range(3584)))
         )
 
         request = Request(
@@ -792,6 +825,62 @@ class TestSchedulerAddRequest:
         scheduler.block_aware_cache.fetch_cache.assert_not_called()
         assert scheduler._should_defer_for_cache_freshness(request) is False
         assert request.request_id not in scheduler._cache_freshness_waits
+
+    def test_admission_defers_for_immediate_4k_boundary_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """A 4K repeat should wait for its 3584-token boundary snapshot."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(4096))
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(3584)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        assert request.request_id in scheduler._cache_freshness_waits
+
+    def test_admission_does_not_defer_for_4k_store_below_relevance_ratio(
+        self, mock_model, mock_tokenizer
+    ):
+        """The lower size gate must not make weakly related 4K stores wait."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(4096))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(1024)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        assert request.request_id not in scheduler._cache_freshness_waits
+        future.result.assert_not_called()
 
     def test_admission_defers_for_relevant_store_during_active_work(
         self, mock_model, mock_tokenizer
@@ -1194,6 +1283,38 @@ class TestSchedulerAbortRequest:
         # The pending clear counts as work so the idle engine loop keeps
         # stepping until it fires.
         assert scheduler.has_requests() is True
+
+    def test_abort_defers_cleanup_while_async_store_is_pending(
+        self, mock_model, mock_tokenizer
+    ):
+        """Abort must not delete snapshots still owned by store_cache."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-store-pending",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.set_finished(RequestStatus.FINISHED_STOPPED)
+        scheduler.requests[request.request_id] = request
+
+        future = concurrent.futures.Future()
+        scheduler._inflight_store_futures[request.request_id] = future
+        scheduler._pending_async_removes.append(
+            (123, request.request_id, future)
+        )
+        snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store = snapshot_store
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._do_abort_request(request.request_id) is False
+        assert request.request_id in scheduler.requests
+        snapshot_store.cleanup_request.assert_not_called()
+        scheduler.block_aware_cache.clear_request_entry.assert_not_called()
+
+        future.set_result(None)
+        assert scheduler._drain_pending_async_removes() is True
+        snapshot_store.cleanup_request.assert_called_once_with(request.request_id)
+        assert request.request_id not in scheduler.requests
 
 
 class TestPrefillAbortInterrupt:
@@ -1624,7 +1745,8 @@ class TestSchedulerReset:
         """
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
-        fake_future = MagicMock()
+        fake_future = concurrent.futures.Future()
+        fake_future.set_result(None)
         scheduler._pending_async_removes.append((999, "req-leaked", fake_future))
         scheduler._inflight_store_futures["req-leaked"] = fake_future
 
@@ -1632,6 +1754,112 @@ class TestSchedulerReset:
 
         assert len(scheduler._pending_async_removes) == 0
         assert len(scheduler._inflight_store_futures) == 0
+
+    def test_reset_waits_for_store_worker_before_snapshot_and_cache_cleanup(
+        self, mock_model, mock_tokenizer
+    ):
+        """reset() must cross the store-future barrier before destructive cleanup."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-reset-barrier",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.set_finished(RequestStatus.FINISHED_STOPPED)
+        request._extracted_cache = object()
+        scheduler.requests[request.request_id] = request
+
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        wait_entered = threading.Event()
+        order = []
+
+        def blocked_store_worker():
+            worker_started.set()
+            assert release_worker.wait(timeout=5)
+            order.append("worker_done")
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(blocked_store_worker)
+        assert worker_started.wait(timeout=2)
+        scheduler._inflight_store_futures[request.request_id] = future
+        scheduler._pending_async_removes.append(
+            (321, request.request_id, future)
+        )
+
+        snapshot_store = MagicMock()
+        snapshot_store.cleanup_request.side_effect = lambda _rid: order.append(
+            "cleanup_request"
+        )
+        snapshot_store.cleanup_all.side_effect = lambda: order.append("cleanup_all")
+        scheduler._boundary_snapshot_store = snapshot_store
+        prefix_cache = MagicMock()
+        prefix_cache.clear.side_effect = lambda: order.append("cache_clear")
+        scheduler.block_aware_cache = prefix_cache
+
+        real_wait = concurrent.futures.wait
+
+        def wait_at_barrier(fs, timeout=None):
+            wait_entered.set()
+            return real_wait(fs, timeout=timeout)
+
+        reset_errors = []
+
+        def run_reset():
+            try:
+                scheduler.reset()
+            except BaseException as exc:  # surfaced on the test thread below
+                reset_errors.append(exc)
+
+        reset_thread = threading.Thread(target=run_reset)
+        try:
+            with patch(
+                "omlx.scheduler.concurrent.futures.wait",
+                side_effect=wait_at_barrier,
+            ):
+                reset_thread.start()
+                assert wait_entered.wait(timeout=2)
+                snapshot_store.cleanup_request.assert_not_called()
+                snapshot_store.cleanup_all.assert_not_called()
+                prefix_cache.clear.assert_not_called()
+
+                release_worker.set()
+                reset_thread.join(timeout=5)
+        finally:
+            release_worker.set()
+            reset_thread.join(timeout=5)
+            executor.shutdown(wait=True)
+
+        assert not reset_thread.is_alive()
+        assert reset_errors == []
+        assert order == [
+            "worker_done",
+            "cleanup_request",
+            "cleanup_all",
+            "cache_clear",
+        ]
+
+    def test_reset_fatal_exits_when_store_cache_worker_times_out(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stuck store worker cannot make reset wait forever or clear caches."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        future = concurrent.futures.Future()
+        scheduler._inflight_store_futures["req-stuck"] = future
+        snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store = snapshot_store
+        scheduler.block_aware_cache = MagicMock()
+
+        with (
+            patch("concurrent.futures.wait", return_value=(set(), {future})),
+            patch("omlx.scheduler.fatal_exit", side_effect=SystemExit) as fatal,
+            pytest.raises(SystemExit),
+        ):
+            scheduler.reset()
+
+        assert "Scheduler reset timed out after 60s" in fatal.call_args.args[0]
+        snapshot_store.cleanup_all.assert_not_called()
+        scheduler.block_aware_cache.clear.assert_not_called()
 
     def test_shutdown_drains_after_bounded_wait(self, mock_model, mock_tokenizer):
         """shutdown() must drain pending removes after the bounded wait.
@@ -2173,8 +2401,17 @@ class TestSchedulerBoundarySnapshots:
 
         assert 4 in scheduler._boundary_cache_snapshots["req-boundary"]
         snapshot = scheduler._boundary_cache_snapshots["req-boundary"][4]
-        # Non-sliceable cache layer is kept as-is in the snapshot
-        assert snapshot == [mock_layer_cache]
+        # The in-memory fallback pre-extracts eagerly (retaining raw cache
+        # objects kept the full KV member of pm-eligible CacheLists alive
+        # per boundary — the quadratic-RAM fallback gap from the #2550
+        # review). A stub layer that defeats extraction falls back to the
+        # raw objects, so both shapes are legitimate; the raw list must
+        # only appear via the explicit fallback, marker-free.
+        if isinstance(snapshot, tuple):
+            assert snapshot[0] == Scheduler._PREFILL_SNAPSHOT_MARKER
+            assert len(snapshot[1]) == 1
+        else:
+            assert snapshot == [mock_layer_cache]
 
     def test_boundary_snapshot_skipped_on_speculative_skew(
         self, mock_model, mock_tokenizer
@@ -2626,6 +2863,7 @@ class TestSchedulerBoundarySnapshots:
             scheduler._boundary_cache_snapshots[request.request_id][4] == snapshot_cache
         )
         assert scheduler._boundary_snapshot_required is True
+        assert mock_model._omlx_mtp_commit_align == 4
 
     def test_prefill_boundary_snapshot_ignores_non_boundary_token_count(
         self, mock_model, mock_tokenizer
@@ -2720,6 +2958,37 @@ class TestSchedulerRotatingBlockAlignment:
         # window_size=128 is below _ROTATING_BLOCK_SIZE_MIN (512),
         # so it gets rounded up to 512 (smallest multiple of 128 >= 512).
         assert scheduler.config.paged_cache_block_size == 512
+
+    def test_pooling_cache_model_aligns_block_size_to_2048(self, mock_tokenizer):
+        RotatingStub = type("RotatingKVCache", (), {})
+        PoolingStub = type("PoolingCache", (), {})
+        CacheListStub = type("CacheList", (), {})
+
+        class PoolingModel:
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 2
+
+            def make_cache(self):
+                rotating = RotatingStub()
+                rotating.max_size = 128
+                sparse = CacheListStub()
+                inner_rotating = RotatingStub()
+                inner_rotating.max_size = 128
+                sparse.caches = [inner_rotating, PoolingStub(), PoolingStub()]
+                return [rotating, sparse]
+
+        scheduler = Scheduler(
+            model=PoolingModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=256),
+        )
+        scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
+        scheduler._align_block_size_with_rotating_window()
+
+        # PoolingCache models (DeepSeek V4 family) target 2048 so prefill
+        # chunks reach the regime where the native prefill kernels pay off.
+        assert scheduler.config.paged_cache_block_size == 2048
 
     def test_multiple_rotating_window_sizes_raise(self, mock_tokenizer):
         RotatingStub = type("RotatingKVCache", (), {})
@@ -3327,8 +3596,196 @@ class TestSchedulerSSDLayerSignature:
             scheduler.shutdown()
 
 
-class TestSpecPrefillDraftCacheSignature:
-    """Regression coverage for SpecPrefill draft-cache isolation (#1925)."""
+class TestSpecPrefillCaches:
+    """Regression coverage for target-prefix reuse and draft-cache isolation."""
+
+    def test_target_prefill_replaces_request_owned_ordinary_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        old_cache = [object()]
+        restored_cache = [object()]
+        request = Request(
+            request_id="specprefill-cache-owner",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[1, 2, 3, 4],
+            num_prompt_tokens=4,
+            cached_tokens=2,
+            remaining_tokens=[3, 4],
+            prompt_cache=old_cache,
+            specprefill_indices=mx.array([0]),
+            specprefill_position_offset=1,
+            specprefill_system_end=3,
+        )
+        request._specprefill_system_tokens = 1
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+        batch_generator = MagicMock()
+        batch_generator.insert.return_value = [42]
+        scheduler.batch_generator = batch_generator
+        scheduler._ensure_batch_generator = MagicMock()
+        scheduler._validate_cache = MagicMock(return_value=True)
+        scheduler._build_sampler_and_processors = MagicMock(
+            return_value=(MagicMock(), [])
+        )
+        scheduler._build_state_machine = MagicMock(return_value=MagicMock())
+        scheduler._preflight_memory_check = MagicMock(return_value=None)
+
+        target_result = SimpleNamespace(
+            prompt_cache=restored_cache,
+            tokens_to_process=[4],
+        )
+        try:
+            with patch(
+                "omlx.specprefill.target.run_specprefill_target_prefill",
+                return_value=target_result,
+            ):
+                scheduled, rejected = scheduler._schedule_waiting()
+
+            assert rejected == []
+            assert scheduled == [request]
+            assert request.prompt_cache is restored_cache
+            assert request.prompt_cache is not old_cache
+            assert batch_generator.insert.call_args.kwargs["caches"] == [
+                restored_cache
+            ]
+        finally:
+            scheduler.shutdown()
+
+    def test_sparse_prefill_failure_drops_partially_appended_cache_hit(
+        self, mock_model, mock_tokenizer
+    ):
+        """A sparse-prefill failure must not fall through with the cache hit.
+
+        run_specprefill_target_prefill appends KV to the restored prefix cache
+        in place when the request had a cache hit (#2443), so after a
+        mid-prefill failure the hit may already carry partial appends;
+        re-prefilling only the post-hit remainder on top of it would
+        double-write those positions. The fallback has to drop the hit and
+        prefill the full prompt from scratch.
+        """
+        # The failure handler runs cleanup_rope, which walks model.layers.
+        mock_model.layers = []
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        old_cache = [object()]
+        fresh_cache = [object()]
+        request = Request(
+            request_id="specprefill-fallback",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[1, 2, 3, 4],
+            num_prompt_tokens=4,
+            cached_tokens=2,
+            remaining_tokens=[3, 4],
+            prompt_cache=old_cache,
+            specprefill_indices=mx.array([0]),
+            specprefill_position_offset=1,
+            specprefill_system_end=3,
+        )
+        request._specprefill_system_tokens = 1
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+        # Keep the preset hit state: without this, the no-paged-cache branch
+        # of _prepare_prefix_cache_for_request resets remaining_tokens to the
+        # full prompt before the specprefill block runs.
+        scheduler._prefix_cache_prepared.add(request.request_id)
+
+        batch_generator = MagicMock()
+        batch_generator.insert.return_value = [42]
+        scheduler.batch_generator = batch_generator
+        scheduler._ensure_batch_generator = MagicMock()
+        scheduler._validate_cache = MagicMock(return_value=True)
+        scheduler._build_sampler_and_processors = MagicMock(
+            return_value=(MagicMock(), [])
+        )
+        scheduler._build_state_machine = MagicMock(return_value=MagicMock())
+        scheduler._preflight_memory_check = MagicMock(return_value=None)
+        scheduler._do_external_prefill = MagicMock(
+            return_value=(fresh_cache, [4])
+        )
+
+        try:
+            with patch(
+                "omlx.specprefill.target.run_specprefill_target_prefill",
+                side_effect=RuntimeError("sparse prefill failed mid-append"),
+            ):
+                scheduled, rejected = scheduler._schedule_waiting()
+
+            assert rejected == []
+            assert scheduled == [request]
+            # The full prompt is re-prefilled without the abandoned hit.
+            prefill_args = scheduler._do_external_prefill.call_args.args
+            assert prefill_args[1] == [1, 2, 3, 4]
+            assert prefill_args[2] is None
+            assert request.prompt_cache is None
+            assert request.cached_tokens == 0
+            assert request.remaining_tokens == [1, 2, 3, 4]
+            assert request.specprefill_indices is None
+            assert batch_generator.insert.call_args.kwargs["caches"] == [
+                fresh_cache
+            ]
+        finally:
+            scheduler.shutdown()
+
+    def test_cache_counters_work_before_a_draft_model_is_configured(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = SimpleNamespace(
+            get_stats=lambda: PrefixCacheStats(hits=2, misses=1)
+        )
+        try:
+            counters = scheduler._collect_cache_counters()
+
+            assert counters is not None
+            assert counters["prefix_hits"] == 2
+            assert "draft_prefix_hits" not in counters
+        finally:
+            scheduler.shutdown()
+
+    def test_static_target_prefix_does_not_create_an_independent_ram_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        try:
+            scheduler.set_specprefill_draft_model(object())
+
+            assert not hasattr(scheduler, "_specprefill_static_prefix_kv_cache")
+        finally:
+            scheduler.shutdown()
+
+    def test_cache_counters_distinguish_target_static_and_draft_reuse(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.block_aware_cache = SimpleNamespace(
+            get_stats=lambda: PrefixCacheStats(
+                hits=11,
+                misses=3,
+                tokens_saved=9_000,
+                exact_prefix_hits=4,
+                exact_prefix_misses=1,
+                exact_prefix_tokens_restored=24_000,
+            )
+        )
+        scheduler._draft_prefix_cache = SimpleNamespace(
+            get_stats=lambda: PrefixCacheStats(
+                hits=8,
+                misses=2,
+                tokens_saved=48_000,
+            )
+        )
+        scheduler.paged_ssd_cache_manager = None
+
+        counters = scheduler._collect_cache_counters()
+
+        assert counters is not None
+        assert counters["target_static_hits"] == 4
+        assert counters["target_static_misses"] == 1
+        assert counters["target_static_tokens_restored"] == 24_000
+        assert counters["draft_prefix_hits"] == 8
+        assert counters["draft_prefix_misses"] == 2
+        assert counters["draft_prefix_tokens_saved"] == 48_000
 
     def test_draft_cache_reconstructs_with_target_turboquant_enabled(
         self, mock_tokenizer, tmp_path
@@ -4695,6 +5152,10 @@ class TestOutputParserSmoke:
         def encode(self, text: str, add_special_tokens: bool = True):
             if text == "\n":
                 return [198]
+            if text == "<|channel>thought":
+                return [100, 45518]
+            if text == "<channel|>":
+                return [101]
             return [10]
 
         def decode(self, token_ids, skip_special_tokens: bool = True):
@@ -4763,6 +5224,108 @@ class TestOutputParserSmoke:
         assert "<|channel>" not in full_stream
         assert "<channel|>" not in full_stream
         assert full_stream == "<think>\nreasoning</think>\nanswer"
+
+    def test_gemma4_prefilled_thought_after_tool_response(self, mock_model):
+        """Tool continuations open the thought channel in the prompt.
+
+        The scheduler must both prepend the normalized opening tag and seed
+        the parser so the generated close marker ends reasoning instead of
+        being discarded as stray markup.
+        """
+        mock_model.config.model_type = "gemma4"
+        tokenizer = self._GemmaTokenizer(
+            {
+                13: "reasoning",
+                14: "<channel|>",
+                15: "answer",
+                16: "<turn|>",
+            }
+        )
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(model_name="google/gemma-4b"),
+        )
+
+        request = Request(
+            request_id="gemma-prefilled-thought",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[9, 100, 45518, 198],
+            num_prompt_tokens=4,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        assert scheduler._detect_needs_think_prefix(request) is True
+        request.needs_think_prefix = True
+
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        responses = [
+            type("Resp", (), {"uid": 99, "token": 13, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 14, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 15, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 16, "finish_reason": "stop"})(),
+        ]
+
+        outputs, finished_ids = scheduler._process_batch_responses(responses)
+
+        assert finished_ids == {request.request_id}
+        assert "".join(output.new_text for output in outputs) == (
+            "<think>\nreasoning</think>\nanswer"
+        )
+        assert outputs[-1].output_text == "<think>\nreasoning</think>\nanswer"
+
+        disabled = Request(
+            request_id="gemma-thinking-disabled",
+            prompt="prompt",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[100, 45518, 198, 101],
+            num_prompt_tokens=4,
+        )
+        assert scheduler._detect_needs_think_prefix(disabled) is False
+
+    def test_gemma4_prefilled_thought_rejection_does_not_create_session(
+        self, mock_model
+    ):
+        """A request rejected before admission must not retain a parser session."""
+        mock_model.config.model_type = "gemma4"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=self._GemmaTokenizer({}),
+            config=SchedulerConfig(model_name="google/gemma-4b"),
+        )
+        request = Request(
+            request_id="gemma-prefilled-rejected",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[9, 100, 45518, 198],
+            num_prompt_tokens=4,
+            status=RequestStatus.WAITING,
+        )
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+        scheduler._preflight_memory_check = MagicMock(
+            return_value=_PreflightRejection(
+                message="too large",
+                estimated_bytes=100,
+                limit_bytes=50,
+            )
+        )
+        scheduler._build_sampler_and_processors = MagicMock(
+            return_value=(MagicMock(), [])
+        )
+
+        scheduled, rejected = scheduler._schedule_waiting()
+
+        assert request.needs_think_prefix is True
+        assert scheduled == []
+        assert len(rejected) == 1
+        assert request.request_id not in scheduler.requests
+        assert request.request_id not in scheduler._output_parser_sessions
 
     def test_gemma4_batch_stop_token_not_streamed(self, mock_model):
         mock_model.config.model_type = "gemma4"
@@ -5498,3 +6061,43 @@ class TestSchedulerModelIdDerivation:
         progress_none = tracker.get_model_progress("def456")
         assert len(progress_none) == 0
         tracker.clear()
+
+
+class TestSupportsSkipLmHead:
+    """Regression coverage for Scheduler._supports_skip_lm_head.
+
+    Chunked prefill discards every chunk's logits, so patched DeepSeek-V4
+    models accept ``skip_lm_head=True`` to skip the full-vocabulary
+    projection. Unknown models must keep stock behavior.
+    """
+
+    def _scheduler_with_model(self, model):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.model = model
+        return scheduler
+
+    def test_detects_support(self):
+        class PatchedModel:
+            def __call__(self, inputs, cache=None, skip_lm_head=False):
+                return None
+
+        scheduler = self._scheduler_with_model(PatchedModel())
+        assert scheduler._supports_skip_lm_head() is True
+        # Result is cached on the instance.
+        assert scheduler._skip_lm_head_supported is True
+
+    def test_rejects_stock_model(self):
+        class StockModel:
+            def __call__(self, inputs, cache=None):
+                return None
+
+        scheduler = self._scheduler_with_model(StockModel())
+        assert scheduler._supports_skip_lm_head() is False
+        assert scheduler._skip_lm_head_supported is False
+
+    def test_rejects_missing_call(self):
+        class NoCall:
+            pass
+
+        scheduler = self._scheduler_with_model(NoCall())
+        assert scheduler._supports_skip_lm_head() is False

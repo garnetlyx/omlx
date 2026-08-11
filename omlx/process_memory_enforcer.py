@@ -124,10 +124,11 @@ def get_macos_vm_stats() -> dict[str, int] | None:
     call so this is safe inside the enforcer poll loop and inside
     per-chunk memcheck.
 
-    The dict exposes only the first four page counters we use for the
-    dynamic ceiling math. Those counters are stable at the front of
-    `vm_statistics64`; using a max-sized `host_info64_t` buffer avoids
-    pinning oMLX to an SDK-specific tail layout.
+    The dict always exposes the first four page counters used by the dynamic
+    ceiling math. Those counters are stable at the front of `vm_statistics64`;
+    speculative and compressed counters are included when the kernel fills the
+    relevant tail fields. A max-sized `host_info64_t` buffer avoids pinning
+    oMLX to an SDK-specific tail layout.
     """
     return psutil_compat.get_macos_vm_stats()
 
@@ -1499,7 +1500,7 @@ class ProcessMemoryEnforcer:
         target = soft
 
         async with self._engine_pool._lock:
-            while self._current_usage_bytes() > target:
+            while (current := self._current_usage_bytes()) > target:
                 pending = self._engine_pool._find_pending_unload_ready_locked()
                 if pending is not None:
                     await self._engine_pool._unload_pending_if_idle_locked(pending)
@@ -1536,7 +1537,7 @@ class ProcessMemoryEnforcer:
                         await self._engine_pool._unload_engine(
                             victim,
                             reason="process_memory_enforcer",
-                            source=f"active={_format_gb(mx.get_active_memory())} limit={_format_gb(self.get_final_ceiling())}",
+                            source=f"active={_format_gb(current)} limit={_format_gb(self.get_final_ceiling())}",
                         )
                         continue
 

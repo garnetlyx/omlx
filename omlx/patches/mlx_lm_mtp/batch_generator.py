@@ -97,6 +97,22 @@ def _set_verify_qmm_armed(flag: bool) -> None:
     except Exception:
         pass
 
+
+def _set_dspark_target_verify(model: Any, flag: bool) -> None:
+    try:
+        import sys
+
+        host = _dspark_host(model)
+        if host is None:
+            return
+        module = sys.modules.get(type(host).__module__)
+        setter = getattr(module, "set_dspark_verify_armed", None)
+        if setter is not None:
+            setter(flag)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -154,13 +170,27 @@ def apply() -> bool:
                 _drop_mtp_batch_state(self, "batch-ineligible")
 
             if _is_mtp_eligible(self):
-                try:
-                    state = _prepare_mtp_state_for_next(self)
-                    if state is not None:
-                        return _mtp_next(self, state)
-                except _MtpStepFallback as exc:
-                    logger.debug("MTP next() fallback to standard step: %s", exc)
-                    _drop_mtp_state(self, "step-fallback")
+                handed_off = False
+                if _singleton_mtp_handoff_ready(self):
+                    # A prefill is waiting on this batch generator; hand the
+                    # singleton back to the standard step at the drained-queue
+                    # boundary so the late join merges this very call (#2515).
+                    handed_off = _handoff_mtp_for_late_join(
+                        self, self._omlx_mtp_state
+                    )
+                if not handed_off:
+                    try:
+                        state = _prepare_mtp_state_for_next(self)
+                        if state is not None:
+                            return _mtp_next(self, state)
+                    except _MtpStepFallback as exc:
+                        logger.debug(
+                            "MTP next() fallback to standard step: %s", exc
+                        )
+                        active = getattr(self, "_omlx_mtp_state", None)
+                        if active is not None:
+                            _reconcile_mtp_to_standard(self, active)
+                        _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
             _log_multirow_mtp_inactive_once(self)
@@ -227,7 +257,9 @@ def apply() -> bool:
                 gen_batch._omlx_mtp_activation_safe = (
                     _batch_generator_allows_mtp_activation(self)
                 )
-            if _generation_batch_has_active_mtp(gen_batch):
+            if _generation_batch_has_active_mtp(
+                gen_batch
+            ) and not _singleton_mtp_handoff_ready(gen_batch):
                 old_completion_batch_size = getattr(
                     self,
                     "completion_batch_size",
@@ -303,7 +335,9 @@ def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
     pending prompt work into the same ``GenerationBatch`` via ``extend()``. That
     merge path forces MTP reconciliation, which can re-prefill a long streamed
     context outside the scheduler's guarded prefill path. Treat active MTP as
-    a temporary full generation batch so late-join requests wait instead.
+    a temporary full generation batch so late-join requests wait, except when
+    ``_singleton_mtp_handoff_ready`` says the singleton path can hand off to
+    the standard step this very call (#2515).
     """
     if gen_batch is None:
         return False
@@ -316,6 +350,29 @@ def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
         getattr(gen_batch, "_omlx_mtp_state", None) is not None
         or getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None
     )
+
+
+def _singleton_mtp_handoff_ready(gen_batch: Any) -> bool:
+    """True when a pending late join should be admitted this call (#2515).
+
+    Requires pending prefill work (the activation-safe stamp is False), no
+    row-wise batch state (that opt-in path keeps the deferral), a valid
+    singleton MTP state, and a drained queue: with at most one committed
+    token left unstreamed the handoff to the standard step is exact and
+    (near-)zero cost, so ``patched_bg_next`` skips the completion pin and
+    ``patched_next`` performs the handoff in the same call. Deep queues keep
+    the pin — each call drains one token, bounded by depth + 1.
+    """
+    if gen_batch is None:
+        return False
+    if getattr(gen_batch, "_omlx_mtp_activation_safe", True):
+        return False
+    if getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None:
+        return False
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if not _mtp_state_valid_for_batch(gen_batch, state):
+        return False
+    return len(state.queue) <= 1
 
 
 def _mtp_common_eligible(gen_batch: Any) -> bool:
@@ -1315,11 +1372,17 @@ def _call_backbone(
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
+    dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
     _rollback_mod.set_undo_armed(True)
-    _set_verify_qmm_armed(True)
+    # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
+    # DeepSeek target on its architecture-native quantized linear path.
+    _set_verify_qmm_armed(not dspark_verify)
+    _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)
     finally:
+        if dspark_verify:
+            _set_dspark_target_verify(model, False)
         _set_verify_qmm_armed(False)
         _rollback_mod.set_undo_armed(False)
 
@@ -1339,16 +1402,19 @@ def _call_backbone(
 
 def _clear_rollback(prompt_cache: List[Any]) -> None:
     """Drop rollback snapshots after a draft is accepted."""
-    for c in prompt_cache:
+    pending = list(prompt_cache)
+    while pending:
+        c = pending.pop()
+        pending.extend(getattr(c, "caches", ()))
         if hasattr(c, "rollback_state") and c.rollback_state is not None:
             c.rollback_state = None
         if getattr(c, "_mtp_draft_stash", None) is not None:
             c._mtp_draft_stash = None
         if getattr(c, "_mtp_undo", None) is not None:
             c._mtp_undo = None
-        for sub in getattr(c, "caches", ()):
-            if getattr(sub, "_mtp_undo", None) is not None:
-                sub._mtp_undo = None
+        if getattr(c, "_undo", None) is not None:
+            c._undo = None
+            c._undo_chain = False
 
 
 def _ensure_uint32(arr):
@@ -1920,6 +1986,87 @@ def _resolve_draft_sampler(gen_batch: Any, state: _MtpState):
     return state.draft_sampler
 
 
+def _dspark_host(model: Any) -> Optional[Any]:
+    """Return the model object that owns an active embedded DSpark head."""
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    for candidate in candidates:
+        if getattr(candidate, "_omlx_dspark_decode_enabled", False):
+            return candidate
+    return None
+
+
+def _dspark_next_drafts(
+    gen_batch: Any,
+    state: _MtpState,
+    hidden_rows: Any,
+    committed: Any,
+    prev_buf: Optional[Any],
+) -> None:
+    """Append committed target taps and sample one DSpark block.
+
+    The expensive three-stage decoder runs once over anchor+noise positions.
+    A rank-R Markov head then samples left-to-right, preserving DSpark's
+    intra-block dependency without another decoder pass.
+    """
+    import mlx.core as mx
+
+    host = _dspark_host(gen_batch.model)
+    if host is None:
+        raise _MtpStepFallback("embedded DSpark host is unavailable")
+
+    depth = state.controller.cur if state.controller is not None else state.depth
+    depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+    n = int(committed.shape[0])
+    if depth <= 0:
+        host.dspark_append_context(hidden_rows, state.mtp_cache)
+        state.hist_offset += n
+        state.drafts = mx.zeros((0,), dtype=mx.uint32)
+        state.draft_lps = []
+        state.draft_accept_lps = []
+        return
+
+    anchor = committed[-1:].reshape(1, 1)
+    logits, _ = host.dspark_forward(
+        hidden_rows,
+        anchor,
+        state.mtp_cache,
+        draft_length=depth,
+    )
+    state.hist_offset += n
+
+    sampler = _resolve_sampler(gen_batch)
+    procs = _proc_list(gen_batch)
+    draft_toks: List[Any] = []
+    draft_lps: List[Any] = []
+    draft_accept_lps: List[Any] = []
+    previous = anchor.reshape(1)
+
+    for idx in range(depth):
+        bias, _ = host.dspark_markov(previous)
+        logits_2d = logits[:, idx, :] + bias
+        if procs is not None and prev_buf is not None:
+            prefix = mx.concatenate(
+                [prev_buf.astype(mx.int32), anchor.reshape(1).astype(mx.int32)]
+                + [token.reshape(1).astype(mx.int32) for token in draft_toks]
+            )
+            logits_2d = _apply_processors(procs, prefix, logits_2d)
+        lp_2d = _logprobs(logits_2d)
+        token = _ensure_uint32(sampler(lp_2d))
+        draft_toks.append(token)
+        draft_lps.append(lp_2d.squeeze(0))
+        draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
+        previous = token.reshape(1)
+
+    state.drafts = mx.concatenate(draft_toks)
+    state.draft_lps = draft_lps
+    state.draft_accept_lps = draft_accept_lps
+    mx.async_eval(state.drafts)
+
+
 def _chain_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -1949,6 +2096,14 @@ def _chain_next_drafts(
     import mlx.core as mx
 
     model = gen_batch.model
+    if _dspark_host(model) is not None:
+        return _dspark_next_drafts(
+            gen_batch,
+            state,
+            hidden_rows,
+            committed,
+            prev_buf,
+        )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
 
@@ -2089,6 +2244,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
     logits, hidden, _ = _call_backbone(
         gen_batch.model, main_tok[:, None], gen_batch.prompt_cache
     )
+    _clear_rollback(gen_batch.prompt_cache)
 
     next_main_logits = logits[:, -1, :]  # (1, vocab) — distribution after main_tok
     next_main_logits = _apply_processors(procs, prev_buf, next_main_logits)
@@ -2297,16 +2453,15 @@ def _emit_batch_responses(gen_batch: Any, batch_state: _MtpBatchState) -> List[A
     return responses
 
 
-def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
-    """Hand a parked sequence back to the standard pipelined decoder.
+def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+    """Materialize ``state.next_main`` and sample its successor.
 
-    At a depth-0 cycle boundary the cache is committed-only and compact, so
-    unlike ``_reconcile_mtp_to_standard`` no re-prefill is needed: feed
-    ``state.next_main`` (already streamed, not yet in the cache), sample its
-    successor as ``_next_tokens``, and drop the MTP state. The batch is
-    marked so eligibility never re-activates MTP — the controller already
-    proved speculation loses here, and the standard step's async pipelining
-    is what the parked cycles cannot match.
+    At a cycle boundary with an empty queue the cache is exactly one token
+    behind the streamed sequence: ``state.next_main`` (already streamed) has
+    no KV yet. Feed it through the backbone, sample ``_next_tokens`` from
+    the resulting logits, and leave the batch in the standard-resumable
+    state. Shared by the depth-0 park and the late-join handoff. Returns
+    False on failure with the batch untouched.
     """
     import mlx.core as mx
 
@@ -2328,13 +2483,61 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [lp_2d.squeeze(0)]
     except Exception as exc:
-        logger.debug("MTP park-to-standard handoff failed: %s", exc)
+        logger.debug("MTP feed-to-standard handoff failed: %s", exc)
+        return False
+    _clear_rollback(gen_batch.prompt_cache)
+    return True
+
+
+def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+    """Hand a parked sequence back to the standard pipelined decoder.
+
+    At a depth-0 cycle boundary the cache is committed-only and compact, so
+    unlike ``_reconcile_mtp_to_standard`` no re-prefill is needed: feed
+    ``state.next_main`` (already streamed, not yet in the cache), sample its
+    successor as ``_next_tokens``, and drop the MTP state. The batch is
+    marked so eligibility never re-activates MTP — the controller already
+    proved speculation loses here, and the standard step's async pipelining
+    is what the parked cycles cannot match.
+    """
+    if not _feed_next_main_to_standard(gen_batch, state):
         return False
     gen_batch._omlx_mtp_parked_uid = state.uid
     if state.controller is not None:
         _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)
     state._finish_reason = "parked"
     _drop_mtp_state(gen_batch, "parked-at-depth-0", log_stats=True)
+    return True
+
+
+def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
+    """Hand a singleton MTP decode to the standard step for a late join.
+
+    A pending prefill can only merge into this batch through mlx-lm's
+    promotion path, which the active-MTP completion pin blocks (#2515). At
+    the drained-queue boundary the handoff is exact and cheap: with one
+    queued token left it is the only committed token whose KV is absent
+    from the cache, so it becomes ``_next_tokens`` verbatim and its stored
+    logprobs keep the standard step's emission byte-identical; with an
+    empty queue the park-style 1-token forward re-derives the same state.
+    Unlike ``_park_mtp_to_standard`` this sets no parked uid and arms no
+    std-tax probe: the sequence is yielding to a batch merge, not losing to
+    standard decode, and must regain MTP once it is a compact singleton
+    again.
+    """
+    import mlx.core as mx
+
+    if len(state.queue) > 1:
+        return False
+    if len(state.queue) == 1:
+        token_id, logprobs_1d, _src = state.queue[0]
+        gen_batch._next_tokens = mx.array([int(token_id)], dtype=mx.uint32)
+        gen_batch._next_logprobs = [logprobs_1d]
+        _clear_rollback(gen_batch.prompt_cache)
+    elif not _feed_next_main_to_standard(gen_batch, state):
+        return False
+    state._finish_reason = "late-join-handoff"
+    _drop_mtp_state(gen_batch, "late-join-handoff", log_stats=True)
     return True
 
 
@@ -2568,36 +2771,39 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             emit_last_id = bonus_id
             emit_last_lp = combined_lp[k]
 
-    # Boundary-aligned commit: when the scheduler needs block-boundary
-    # cache snapshots (hybrid models), land the committed run exactly on
-    # the next block boundary whenever it falls inside the accepted
-    # drafts. The emit-time snapshot capture can then observe the boundary
-    # state (cache offset == emitted count), which the emit queue's
-    # run-ahead otherwise makes rare. Emitting fewer verified drafts is
-    # distribution-exact; the cost is at most depth-1 verified tokens once
-    # per block.
-    align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
-    if align > 0 and m > 0:
-        emitted = len(gen_batch.tokens[0])
-        aligned = ((emitted // align) + 1) * align - emitted
-        if 0 < aligned < m:
-            m = aligned
-            emit_last_id = draft_ids[m]
-            emit_last_lp = combined_lp[m]
-
     # Clamp the accepted count to what every cache layer can roll back
     # (optional model hook — DeepSeek-V4 PoolingCache replay windows are
     # bounded). Emitting fewer verified drafts is always correct; position
     # ``m`` was itself accepted when the clamp lowers it, so its draft
     # token is a fair emit for the correction slot.
+    clamp = getattr(gen_batch.model, "mtp_clamp_accept", None)
     if m < k:
-        clamp = getattr(gen_batch.model, "mtp_clamp_accept", None)
         if callable(clamp):
             clamped = int(clamp(gen_batch.prompt_cache, m, k))
             if clamped < m:
                 m = clamped
                 emit_last_id = draft_ids[m]
                 emit_last_lp = combined_lp[m]
+
+    # Apply boundary alignment after the rollback clamp so its final accepted
+    # count remains authoritative. If alignment itself requires more rollback,
+    # re-run the model clamp against the shorter accepted prefix.
+    align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+    emitted = len(gen_batch.tokens[0])
+    to_boundary = ((emitted // align) + 1) * align - emitted if align > 0 else 0
+    if 0 < to_boundary < m:
+        m = to_boundary
+        if callable(clamp):
+            clamped = int(clamp(gen_batch.prompt_cache, m, k))
+            if clamped < m:
+                m = clamped
+        emit_last_id = draft_ids[m]
+        emit_last_lp = combined_lp[m]
+
+    # A clamp can put the final verify token on the boundary, while a full
+    # accept can put its bonus token there. Neither token is present in the
+    # backbone cache yet, so materialize it before the queue reaches it.
+    materialize_boundary_emit = align > 0 and to_boundary > 0 and to_boundary == m + 1
 
     # --- stats ---
     state.stats.cycles += 1
@@ -2650,6 +2856,8 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
     state.next_main = next_main
     state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
+    if materialize_boundary_emit:
+        _materialize_mtp_boundary_emit(gen_batch, state)
     if state.controller is not None:
         keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
         if keepalive:
@@ -2660,6 +2868,56 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             (time.perf_counter() - cycle_t0) * 1000,
             time_sample=not keepalive,
         )
+
+
+def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
+    """Commit a queued verify/bonus boundary token before it is emitted.
+
+    MTP normally leaves the final token of a cycle one position ahead of the
+    backbone cache. If that token is the next block boundary, process it with a
+    confirmed one-token forward and seed the following target token. The queue
+    then reaches the boundary with an exactly aligned cache snapshot and keeps
+    the usual one-token pipeline skew after the following token is emitted.
+    """
+    import time
+
+    import mlx.core as mx
+
+    if not state.queue:
+        raise _MtpStepFallback("boundary materialization has no queued token")
+
+    boundary_id = int(state.queue[-1][0])
+    boundary_tok = mx.array([boundary_id], dtype=mx.uint32)
+    procs = _proc_list(gen_batch)
+    prev_buf = None
+    if procs is not None:
+        prev_buf = gen_batch._token_context[0].update_and_fetch(boundary_tok)
+
+    t0 = time.perf_counter()
+    logits, hidden, _ = _call_backbone(
+        gen_batch.model,
+        boundary_tok[:, None],
+        gen_batch.prompt_cache,
+    )
+    _clear_rollback(gen_batch.prompt_cache)
+    next_logits = _apply_processors(procs, prev_buf, logits[:, -1, :])
+    next_lp_2d = _logprobs(next_logits)
+    next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
+    mx.eval(next_tok)
+    state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    _chain_next_drafts(
+        gen_batch,
+        state,
+        hidden[:, -1:],
+        next_tok,
+        prev_buf,
+    )
+    state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
+    next_id = int(next_tok.tolist()[0])
+    state.next_main = next_tok
+    state.queue.append((next_id, next_lp_2d.squeeze(0), "bonus"))
 
 
 def _chain_rollback(

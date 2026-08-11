@@ -4,7 +4,7 @@
 import asyncio
 from contextlib import suppress
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -120,6 +120,8 @@ class TestMacOSVMStats:
                 stats[1] = 20
                 stats[2] = 30
                 stats[3] = 40
+                stats[psutil_compat._VM_SPECULATIVE_INDEX] = 50
+                stats[psutil_compat._VM_COMPRESSOR_INDEX] = 60
                 count._obj.value = 104
                 return 0
 
@@ -135,6 +137,8 @@ class TestMacOSVMStats:
             "active": 20 * 4096,
             "inactive": 30 * 4096,
             "wired": 40 * 4096,
+            "speculative": 50 * 4096,
+            "compressed": 60 * 4096,
         }
 
     def test_short_host_info64_response_returns_none(self):
@@ -350,7 +354,7 @@ class TestCheckAndEnforce:
         }
         enforcer._engine_pool._find_lru_victim.return_value = "model-a"
 
-        async def fake_unload(model_id):
+        async def fake_unload(model_id, **kwargs):
             enforcer._engine_pool._entries[model_id].engine = None
 
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
@@ -364,7 +368,7 @@ class TestCheckAndEnforce:
                 ]
             )
             await enforcer._check_and_enforce()
-        enforcer._engine_pool._unload_engine.assert_called_once_with("model-a")
+        enforcer._engine_pool._unload_engine.assert_called_once_with("model-a", reason="process_memory_enforcer", source=ANY)
 
     @pytest.mark.asyncio
     async def test_stops_when_all_pinned(self, enforcer):
@@ -409,7 +413,7 @@ class TestCheckAndEnforce:
             "model-b",
         ]
 
-        async def fake_unload(model_id):
+        async def fake_unload(model_id, **kwargs):
             enforcer._engine_pool._entries[model_id].engine = None
 
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
@@ -462,7 +466,7 @@ class TestCheckAndEnforce:
             "loading-model": loading_entry,
         }
 
-        async def fake_unload(model_id):
+        async def fake_unload(model_id, **kwargs):
             enforcer._engine_pool._entries[model_id].engine = None
 
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
@@ -484,7 +488,7 @@ class TestCheckAndEnforce:
             await enforcer._check_and_enforce()
 
         # LRU victim evicted first
-        enforcer._engine_pool._unload_engine.assert_called_once_with("model-a")
+        enforcer._engine_pool._unload_engine.assert_called_once_with("model-a", reason="process_memory_enforcer", source=ANY)
         # Then loading model abort requested
         assert loading_entry.abort_loading is True
 
@@ -1441,7 +1445,7 @@ class TestSingleModelMemoryPressure:
         enforcer._engine_pool._entries = {"big-model": entry}
         enforcer._engine_pool._find_lru_victim.return_value = "big-model"
 
-        async def fake_unload(model_id):
+        async def fake_unload(model_id, **kwargs):
             enforcer._engine_pool._entries[model_id].engine = None
 
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
@@ -1457,7 +1461,7 @@ class TestSingleModelMemoryPressure:
             await enforcer._check_and_enforce()
 
         engine.abort_all_requests.assert_awaited_once()
-        enforcer._engine_pool._unload_engine.assert_awaited_once_with("big-model")
+        enforcer._engine_pool._unload_engine.assert_awaited_once_with("big-model", reason="process_memory_enforcer", source=ANY)
         assert entry.engine is None
 
     @pytest.mark.asyncio
@@ -1536,7 +1540,7 @@ class TestSingleModelMemoryPressure:
         }
         enforcer._engine_pool._find_lru_victim.return_value = "idle-model"
 
-        async def fake_unload(model_id):
+        async def fake_unload(model_id, **kwargs):
             enforcer._engine_pool._entries[model_id].engine = None
 
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
@@ -1551,7 +1555,7 @@ class TestSingleModelMemoryPressure:
             )
             await enforcer._check_and_enforce()
 
-        enforcer._engine_pool._unload_engine.assert_awaited_once_with("idle-model")
+        enforcer._engine_pool._unload_engine.assert_awaited_once_with("idle-model", reason="process_memory_enforcer", source=ANY)
         # Idle model's requests aborted before eviction (0 requests)
         engine_idle.abort_all_requests.assert_awaited_once()
         # Active model's requests NOT aborted

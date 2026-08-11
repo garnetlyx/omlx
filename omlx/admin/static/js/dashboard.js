@@ -61,6 +61,12 @@
         'gemma4_unified_assistant',
         'qwen3_5_mtp',
     ]);
+    // DFlash drafters that carry no "dflash" name token. Meta ships the Muse
+    // Glimmer DFlash drafter as "-assistant", which oMLX's name heuristics
+    // would otherwise route to the MTP/spec-prefill buckets.
+    const DFLASH_DRAFTER_CONFIG_MODEL_TYPES = new Set([
+        'muse_glimmer_assistant',
+    ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
@@ -115,11 +121,24 @@
                     markitdown_max_file_size_mb: 25,
                     markitdown_max_files_per_request: 5,
                     markitdown_pdf_processing_engine: 'markitdown',
+                    web_search_provider: 'ddgs',
+                    web_search_brave_api_key: '',
+                    web_search_searxng_url: '',
+                    web_search_ddgs_backends: '',
+                    web_search_max_results: 3,
+                    web_search_content_mode: 'snippet',
+                    web_search_content_truncate: true,
+                    web_search_content_max_chars: 20000,
                 },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
+
+            // Web search "Test search" button state
+            webSearchTest: { running: false, ok: null, message: '' },
+            // Engines selectable for the DDGS Custom provider (ddgs 9.14.1 text registry)
+            ddgsBackendList: ['brave', 'duckduckgo', 'grokipedia', 'mojeek', 'wikipedia', 'yahoo', 'yandex'],
 
             // Cache slider (0-100%)
             cachePercent: 10,
@@ -183,6 +202,7 @@
                 trust_remote_code: false,
             },
             savingModelSettings: false,
+            importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
 
@@ -448,6 +468,7 @@
 
             // Benchmark state
             benchModelId: '',
+            benchContextProfile: 'code_python',
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchForceLmEngine: false,
@@ -476,7 +497,8 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
+            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
             // bench is running" banner + disables Start so the user doesn't
@@ -1392,6 +1414,10 @@
             },
 
             isDflashDraftModel(model) {
+                const configType = String(model?.config_model_type || '').toLowerCase();
+                if (DFLASH_DRAFTER_CONFIG_MODEL_TYPES.has(configType)) {
+                    return true;
+                }
                 return /(^|[-_/\s])dflash($|[-_/\s])/i.test(this.draftModelSearchText(model));
             },
 
@@ -1435,6 +1461,8 @@
             // which the VLM MTP decode path cannot apply (#2399). Mirrors
             // vlm_mtp_processor_conflicts() in model_settings.py; neutral
             // values (repetition 1.0, presence 0.0) do not conflict.
+            // Thinking budget is exempt: it is applied on the vlm_mtp path
+            // at verify time (MTPProcessingSampler).
             vlmMtpProcessorConflict() {
                 const ms = this.modelSettings;
                 if (!ms) return false;
@@ -1443,7 +1471,6 @@
                 const pres = num(ms.presence_penalty);
                 return (rep !== null && rep !== 1.0)
                     || (pres !== null && pres !== 0.0)
-                    || !!ms.enableThinkingBudget
                     || !!ms.guided_grammar_enabled;
             },
 
@@ -1959,6 +1986,30 @@
                     this.computeDrift();
                 }
                 this.showModelSettingsModal = true;
+            },
+
+            async importMtplxSidecar() {
+                if (!this.selectedModel || this.importingMtplx) return;
+                this.importingMtplx = true;
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/import-mtplx`, {
+                        method: 'POST',
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        alert(data.detail || window.t('js.error.mtplx_import_failed'));
+                        return;
+                    }
+                    if (data.message) alert(data.message);
+                    // Refresh so mtp_compatible flips and the toggle unlocks.
+                    await this.loadModels();
+                    const model = this.models.find(m => m.id === this.selectedModel.id);
+                    if (model) await this.openModelSettings(model);
+                } catch (e) {
+                    alert(window.t('js.error.mtplx_import_failed'));
+                } finally {
+                    this.importingMtplx = false;
+                }
             },
 
             async saveModelSettings() {
@@ -2527,6 +2578,14 @@
                             markitdown_max_file_size_mb: this.globalSettings.integrations.markitdown_max_file_size_mb,
                             markitdown_max_files_per_request: this.globalSettings.integrations.markitdown_max_files_per_request,
                             markitdown_pdf_processing_engine: this.globalSettings.integrations.markitdown_pdf_processing_engine,
+                            web_search_provider: this.globalSettings.integrations.web_search_provider,
+                            web_search_brave_api_key: this.globalSettings.integrations.web_search_brave_api_key,
+                            web_search_searxng_url: this.globalSettings.integrations.web_search_searxng_url,
+                            web_search_ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends,
+                            web_search_max_results: this.globalSettings.integrations.web_search_max_results,
+                            web_search_content_mode: this.globalSettings.integrations.web_search_content_mode,
+                            web_search_content_truncate: this.globalSettings.integrations.web_search_content_truncate,
+                            web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                         }),
                     });
                     if (!response.ok) {
@@ -2534,6 +2593,57 @@
                     }
                 } catch (err) {
                     console.error('Failed to save integration settings:', err);
+                }
+            },
+
+            ddgsBackendChecked(name) {
+                return (this.globalSettings.integrations.web_search_ddgs_backends || '')
+                    .split(',').map(s => s.trim()).filter(Boolean).includes(name);
+            },
+
+            toggleDdgsBackend(name) {
+                const current = (this.globalSettings.integrations.web_search_ddgs_backends || '')
+                    .split(',').map(s => s.trim()).filter(Boolean);
+                const next = current.includes(name)
+                    ? current.filter(b => b !== name)
+                    : [...current, name];
+                this.globalSettings.integrations.web_search_ddgs_backends = next.join(',');
+                this.saveIntegrationSettings();
+            },
+
+            async testWebSearch() {
+                if (this.webSearchTest.running) return;
+                this.webSearchTest = { running: true, ok: null, message: '' };
+                try {
+                    const response = await fetch('/admin/api/web-search/test', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            provider: this.globalSettings.integrations.web_search_provider,
+                            brave_api_key: this.globalSettings.integrations.web_search_brave_api_key || '',
+                            searxng_url: this.globalSettings.integrations.web_search_searxng_url || '',
+                            ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends || '',
+                        }),
+                    });
+                    const payload = await response.json();
+                    if (payload.ok) {
+                        this.webSearchTest = {
+                            running: false,
+                            ok: true,
+                            message: window.t('settings.integrations.websearch.test_success')
+                                .replace('{count}', (payload.results || []).length),
+                        };
+                    } else {
+                        const message = payload.error?.message
+                            || window.t('settings.integrations.websearch.test_failed');
+                        this.webSearchTest = { running: false, ok: false, message };
+                    }
+                } catch (err) {
+                    this.webSearchTest = {
+                        running: false,
+                        ok: false,
+                        message: window.t('settings.integrations.websearch.test_failed'),
+                    };
                 }
             },
 
@@ -2710,6 +2820,31 @@
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                 return String(n);
+            },
+
+            formatDFlashSessionStats(totals) {
+                if (!totals || totals.requests <= 1) return '';
+
+                const parts = [];
+                if (totals.speculative_requests > 0) {
+                    parts.push(
+                        Math.round((totals.acceptance_ratio || 0) * 100) + '% ' +
+                        window.t('status.active_models.dflash_draft_share'),
+                        (totals.accepted_draft_tokens_per_cycle || 0).toFixed(2) + ' ' +
+                        window.t('status.active_models.dflash_accepted_draft_per_cycle'),
+                        (totals.tokens_per_cycle || 0).toFixed(2) + ' ' +
+                        window.t('status.active_models.dflash_output_per_cycle'),
+                        totals.speculative_requests + ' ' +
+                        window.t('status.active_models.dflash_speculative_requests'),
+                    );
+                }
+                if (totals.fallback_requests > 0) {
+                    parts.push(
+                        totals.fallback_requests + ' ' +
+                        window.t('status.active_models.dflash_fallback_requests'),
+                    );
+                }
+                return window.t('status.active_models.dflash_session') + ': ' + parts.join(' · ');
             },
 
             formatDurationShort(seconds) {
@@ -2948,6 +3083,7 @@
                 this.benchUploadDone = null;
                 this.benchUploading = false;
                 this.benchUploadSkipped = null;
+                this.benchUploadFlags = [];
                 this.benchRunExternal = this.benchExternalEnabled
                     ? { base_url: this.externalBaseUrl.trim(), model: this.externalModel.trim() }
                     : null;
@@ -2958,6 +3094,7 @@
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
+                            context_profile: this.benchContextProfile,
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
@@ -3048,6 +3185,7 @@
                             }
                         } else if (data.type === 'upload_done') {
                             this.benchUploadDone = data.data;
+                            this.benchUploadFlags = data.data.feature_flags || [];
                             this.benchUploading = false;
                             this.benchRunning = false;
                             this.benchProgress = null;
@@ -3055,7 +3193,7 @@
                             this.benchEventSource = null;
                         } else if (data.type === 'upload_skipped') {
                             this.benchUploadSkipped = {
-                                reason: data.reason || 'experimental_features',
+                                reason: data.reason || 'external_endpoint',
                                 features: data.features || [],
                             };
                             this.benchUploading = false;
@@ -3354,6 +3492,7 @@
                     lines.push(`Benchmark Model: ${this.benchModelId}`);
                     lines.push(`Engine: ${this.benchForceLmEngine ? 'Force mlx-lm' : 'Auto'}`);
                 }
+                lines.push(`Context: ${this.benchContextLabel(this.benchContextProfile)}`);
                 lines.push('='.repeat(80));
 
                 // Single Request Results
@@ -3491,6 +3630,7 @@
                         this.benchOtherActive = {
                             bench_id: data.bench_id,
                             model_id: data.model_id,
+                            context_profile: data.context_profile || 'code_python',
                             force_lm_engine: !!data.force_lm_engine,
                             external: !!data.external,
                         };
@@ -3512,6 +3652,7 @@
             // /api/bench/active. External model ids aren't in the local
             // dropdown, so the external flag drives which controls light up.
             _restoreBenchRunSource(data) {
+                this.benchContextProfile = data.context_profile || 'code_python';
                 if (data.external) {
                     this.benchExternalEnabled = true;
                     this.benchRunExternal = {
@@ -3526,6 +3667,17 @@
                     this.benchExternalEnabled = false;
                     this.benchRunExternal = null;
                 }
+            },
+
+            benchContextLabel(profile) {
+                const keys = {
+                    code_python: 'bench.config.context.code_python',
+                    code_mixed: 'bench.config.context.code_mixed',
+                    novel_ko: 'bench.config.context.novel_ko',
+                    novel_en: 'bench.config.context.novel_en',
+                    novel_ja: 'bench.config.context.novel_ja',
+                };
+                return window.t(keys[profile] || keys.code_python);
             },
 
             // User clicked "View live" on the banner — clear the stale
@@ -3544,6 +3696,7 @@
                 this.benchUploadResults = [];
                 this.benchUploadDone = null;
                 this.benchUploadSkipped = null;
+                this.benchUploadFlags = [];
                 this.benchProgress = null;
                 this.benchError = '';
                 this.connectBenchSSE(other.bench_id);
