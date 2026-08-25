@@ -230,7 +230,7 @@ class _FakePool:
     async def get_engine(self, model_id, force_lm=False):
         return self._engine
 
-    async def _unload_engine(self, model_id):
+    async def _unload_engine(self, model_id, *, reason="unspecified", source=None):
         self.unloaded.append(model_id)
 
     def get_entry(self, model_id):
