@@ -613,7 +613,7 @@ class TestUpdateGlobalSettingsAudioUpload:
 
         with _patched_global_settings(gs):
             result = asyncio.run(
-                admin_routes.update_global_settings(request=request, is_admin=True)
+                admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
             )
 
         assert result["success"] is True
@@ -629,7 +629,7 @@ class TestUpdateGlobalSettingsAudioUpload:
         with _patched_global_settings(gs):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
-                    admin_routes.update_global_settings(request=request, is_admin=True)
+                    admin_routes.update_global_settings(request=request, http_request=MagicMock(), is_admin=True)
                 )
 
         assert exc_info.value.status_code == 400
