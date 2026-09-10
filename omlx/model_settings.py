@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 # Current settings file format version
 SETTINGS_VERSION = 1
 
+# The Lightning MTP runtime clamps deeper requests to this global ceiling.
+# Keep API validation and runtime normalization on the same contract.
+MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
+
 
 def vlm_mtp_processor_conflicts(data: dict) -> list:
     """Names of settings that need per-request logits processors and
@@ -212,6 +216,10 @@ class ModelSettings:
     enable_thinking: Optional[bool] = (
         None  # Explicit toggle for thinking/reasoning mode (None = auto)
     )
+    # Qwen4-Exp only: keep the large PLE N-gram table on SSD and gather rows
+    # through mmap. The runtime may force this on when resident loading cannot
+    # fit under the configured model-memory ceiling but mmap loading can.
+    qwen4_ple_ssd_offload: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

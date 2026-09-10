@@ -23,6 +23,18 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         )
     }
 
+    func testLightningMtpAllowsTurboQuantInWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        vm.mtpEnabled = true
+        vm.turboquantKvEnabled = true
+
+        XCTAssertNil(vm.mtpConflictReason)
+
+        let settings = vm.currentSettingsDict()
+        XCTAssertEqual(settings["mtp_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
+    }
+
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
         let vm = ModelSettingsScreenVM()
         vm.modelID = "Qwopus3.6-35B-A3B-v1-4bit-MLXVLM-Target"
@@ -225,6 +237,29 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertFalse(vm.isQwen35AnePrefillModel)
     }
 
+    func testQwen4SsdOffloadWireKeysAndCompatibility() throws {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "qwen4", configModelType: "qwen4_exp")
+        XCTAssertTrue(vm.isQwen4Exp)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let dto = try decoder.decode(
+            ModelSettingsDTO.self,
+            from: Data(#"{"qwen4_ple_ssd_offload":true}"#.utf8)
+        )
+        XCTAssertEqual(dto.qwen4PleSsdOffload, true)
+
+        var patch = ModelSettingsPatch()
+        patch.qwen4PleSsdOffload = true
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try JSONSerialization.jsonObject(
+            with: encoder.encode(patch)
+        ) as? [String: Any]
+        XCTAssertEqual(object?["qwen4_ple_ssd_offload"] as? Bool, true)
+    }
+
     func testQwenAneSettingsDecodeFromServerAndEncodeForPatch() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -328,6 +363,10 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
+            qwen4PleSsdOffloadSupported: nil,
+            qwen4PleSsdOffloadForced: nil,
+            qwen4PleResidentBytes: nil,
+            qwen4PleMmapBytes: nil,
             virtual: nil,
             settings: nil
         )

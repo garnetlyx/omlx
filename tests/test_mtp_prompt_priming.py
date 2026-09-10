@@ -8,6 +8,8 @@ in the patched ``TextModel.__call__`` and the activation handoff in
 wiring is exercised by the real-model smoke test.
 """
 
+import threading
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +58,26 @@ def _make_cache(model):
     return make_prompt_cache(model)
 
 
+def _make_batch_cache(model):
+    """The cache shape every request takes through ``BatchGenerator``.
+
+    ``PromptProcessingBatch.__init__`` merges the per-request caches
+    (mlx-lm ``_merge_caches``), so even a single request runs on ``Batch*``
+    entries whose ``offset`` is a 1-element ``mx.array`` rather than an int.
+    """
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
+
+    batched = []
+    for c in _make_cache(model):
+        if isinstance(c, KVCache):
+            batched.append(BatchKVCache.merge([c]))
+        else:
+            if isinstance(c, ArraysCache):
+                c.left_padding = mx.array([0])
+            batched.append(c)
+    return batched
+
+
 def _tokens(n, seed=0):
     mx.random.seed(seed)
     return mx.random.randint(0, TINY_CONFIG["vocab_size"], (n,)).astype(mx.uint32)
@@ -88,6 +110,108 @@ def _reference_head_cache(model, tokens, extra_tok=None):
     )
     mx.eval([c.state for c in ref_cache])
     return ref_cache
+
+
+class _MemoryMtpPrefixCache:
+    """Minimal scheduler/cache contract for prompt-history integration tests."""
+
+    def __init__(self, block_size=8):
+        self.block_size = block_size
+        self.snapshots = {}
+
+    def _key(self, tokens, boundary):
+        return tuple(tokens[:boundary]), int(boundary)
+
+    def store_mtp_prefix_snapshot(self, tokens, boundary, snapshot, **kwargs):
+        self.snapshots[self._key(tokens, boundary)] = snapshot
+        return True
+
+    def restore_mtp_prefix_snapshot(self, tokens, boundary, **kwargs):
+        return self.snapshots.get(self._key(tokens, boundary))
+
+
+def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts():
+    """The production sidecar is only visible while its backbone tip lives."""
+    from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+    class _HashMap:
+        def __init__(self):
+            self.blocks = {}
+
+        def get_block(self, key):
+            return self.blocks.get(key)
+
+    hash_map = _HashMap()
+    cache = BlockAwarePrefixCache.__new__(BlockAwarePrefixCache)
+    cache.block_size = 4
+    cache.paged_cache = SimpleNamespace(
+        model_name="tiny-mtp-test",
+        cached_block_hash_to_block=hash_map,
+    )
+    cache._prefix_index = {}
+    cache._mtp_prefix_snapshots = OrderedDict()
+    cache._mtp_prefix_snapshot_lock = threading.RLock()
+
+    tokens = list(range(8))
+    snapshot = object()
+    assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
+    tip = cache._mtp_prefix_chain_tip(tokens, 8)
+    assert tip is not None
+    # Publishing precedes the async backbone store, so the snapshot must not
+    # become restorable until the matching ordinary block is live.
+    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is None
+    hash_map.blocks[tip] = object()
+    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is snapshot
+
+    cache._on_block_hash_dropped(tip)
+    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is None
+
+
+def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
+    """MTP sidecars remain bounded and follow wholesale cache clears."""
+    from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+    class _HashMap:
+        def __init__(self):
+            self.blocks = {}
+
+        def get_block(self, key):
+            return self.blocks.get(key)
+
+    hash_map = _HashMap()
+    cache = BlockAwarePrefixCache.__new__(BlockAwarePrefixCache)
+    cache.block_size = 4
+    cache.paged_cache = SimpleNamespace(
+        model_name="tiny-mtp-lru-test",
+        cached_block_hash_to_block=hash_map,
+    )
+    cache._prefix_index = {}
+    cache._mtp_prefix_snapshots = OrderedDict()
+    cache._mtp_prefix_snapshot_lock = threading.RLock()
+
+    entries = []
+    for branch in range(5):
+        tokens = [branch * 100 + i for i in range(8)]
+        snapshot = object()
+        assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
+        tip = cache._mtp_prefix_chain_tip(tokens, 8)
+        assert tip is not None
+        hash_map.blocks[tip] = object()
+        entries.append((tokens, tip, snapshot))
+
+    assert len(cache._mtp_prefix_snapshots) == 4
+    assert cache.restore_mtp_prefix_snapshot(entries[0][0], 8) is None
+    assert cache.restore_mtp_prefix_snapshot(entries[-1][0], 8) is entries[-1][2]
+
+    # Individual backbone eviction removes the matching sidecar even if a
+    # stale test hash-map entry remains, then the wholesale clear drops all
+    # remaining sidecars and the ordinary prefix index together.
+    cache._on_block_hash_dropped(entries[-1][1])
+    assert cache.restore_mtp_prefix_snapshot(entries[-1][0], 8) is None
+    cache._prefix_index[b"ordinary"] = (1, 2, 3)
+    cache._on_hash_map_cleared()
+    assert not cache._mtp_prefix_snapshots
+    assert not cache._prefix_index
 
 
 @pytest.fixture(autouse=True)
@@ -155,6 +279,100 @@ class TestCaptureFold:
             assert mx.allclose(k, rk, rtol=1e-4, atol=1e-4)
             assert mx.allclose(v, rv, rtol=1e-4, atol=1e-4)
 
+    def test_warm_prefix_restores_exact_head_history_without_trunk_reforward(
+        self, strict_model
+    ):
+        """A backbone hit at C restores MTP(C-1)+hidden(C-1), then folds
+        only the uncached suffix and activation seam.  The resulting head
+        cache must equal a one-shot cold oracle exactly within model dtype.
+        Repeating scheduler preparation for the same request is idempotent.
+        """
+        model = strict_model
+        tokens = _tokens(13, seed=40)
+        main_tok = _tokens(1, seed=41)
+        sidecar = _MemoryMtpPrefixCache(block_size=8)
+
+        cold_cache = _make_cache(model)
+        assert not prompt_priming.prepare_prefix_context(
+            model,
+            request_id="cold",
+            prompt_tokens=tokens.tolist(),
+            cached_tokens=0,
+            prefix_cache=sidecar,
+        )
+        _chunked_prefill(model, cold_cache, tokens, [8, 5])
+        cold_ctx = prompt_priming._find_ctx(model)
+        assert cold_ctx is not None
+        cold_final_pending = cold_ctx.pending_hidden + 0
+        mx.eval(cold_final_pending)
+        model(main_tok[None, :], cache=cold_cache, return_hidden=True)
+        cold_primed = prompt_priming.take_primed(model, cold_cache, main_tok)
+        assert cold_primed is not None
+        snapshot_key = (tuple(tokens[:8].tolist()), 8)
+        assert snapshot_key in sidecar.snapshots
+        boundary_pending = sidecar.snapshots[snapshot_key].pending_hidden
+
+        # Build the already-restored backbone cache outside capture.  Start
+        # tracing only after sidecar restore: a correct warm path invokes the
+        # MTP head for suffix(5)+seam(1), never for the cached trunk(8).
+        warm_cache = _make_cache(model)
+        with prompt_priming.suppress_capture():
+            model(tokens[:8][None, :], cache=warm_cache)
+        assert prompt_priming.prepare_prefix_context(
+            model,
+            request_id="warm",
+            prompt_tokens=tokens.tolist(),
+            cached_tokens=8,
+            prefix_cache=sidecar,
+        )
+        warm_ctx = prompt_priming._find_ctx(model)
+        assert warm_ctx is not None
+        assert warm_ctx.folded == 7
+        assert warm_ctx.expected_offset == 8
+        assert mx.array_equal(warm_ctx.pending_hidden, boundary_pending).item()
+
+        # The scheduler's prepared-set normally prevents this second call;
+        # the hook itself also guarantees it cannot reset/double-prime a live
+        # request if invoked twice.
+        assert prompt_priming.prepare_prefix_context(
+            model,
+            request_id="warm",
+            prompt_tokens=tokens.tolist(),
+            cached_tokens=8,
+            prefix_cache=sidecar,
+        )
+        assert prompt_priming._find_ctx(model) is warm_ctx
+
+        mtp_rows = []
+        original_mtp_forward = model.mtp_forward
+
+        def traced_mtp_forward(hidden, next_ids, cache, **kwargs):
+            mtp_rows.append(int(next_ids.shape[1]))
+            return original_mtp_forward(hidden, next_ids, cache, **kwargs)
+
+        model.mtp_forward = traced_mtp_forward
+        _chunked_prefill(model, warm_cache, tokens[8:], [5])
+        warm_final_ctx = prompt_priming._find_ctx(model)
+        assert warm_final_ctx is not None
+        assert mx.array_equal(
+            warm_final_ctx.pending_hidden, cold_final_pending
+        ).item()
+        model(main_tok[None, :], cache=warm_cache, return_hidden=True)
+        warm_primed = prompt_priming.take_primed(model, warm_cache, main_tok)
+        assert warm_primed is not None
+        assert warm_primed[1] == len(tokens)
+        assert mtp_rows == [5, 1]
+
+        mx.eval(
+            [c.state for c in cold_primed[0]],
+            [c.state for c in warm_primed[0]],
+        )
+        for (k, v), (rk, rv) in zip(
+            _kv_entries(warm_primed[0]), _kv_entries(cold_primed[0])
+        ):
+            assert mx.array_equal(k, rk).item()
+            assert mx.array_equal(v, rv).item()
+
     def test_chunk_size_one_seam_is_dense(self, model):
         """A trailing S==1 forward (the __init__ _step seam) still folds."""
         n = 8
@@ -218,6 +436,22 @@ class TestCaptureSkips:
             model(toks, cache=cache)
         except Exception:
             pass
+        assert prompt_priming.prime_ctx_stats(model) is None
+
+    def test_batch_forward_drops_pending_ctx(self, model):
+        """A B>1 forward advances the anchor without capture seeing its
+        tokens, so a later singleton chunk could read as contiguous across
+        it. The pending timeline must not survive one."""
+        tokens = _tokens(12, seed=31)
+        cache = _make_cache(model)
+        _chunked_prefill(model, cache, tokens[:6], [6])
+        assert prompt_priming.prime_ctx_stats(model) == 5
+        prompt_priming.maybe_capture(
+            model,
+            mx.zeros((2, 3), dtype=mx.uint32),
+            mx.zeros((2, 3, TINY_CONFIG["hidden_size"])),
+            cache,
+        )
         assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_offset_rewind_invalidates_and_restarts(self, model):
@@ -332,6 +566,130 @@ class TestCaptureSkips:
         assert prompt_priming.prime_ctx_stats(model) is not None
         prompt_priming.drop_ctx(model)
         assert prompt_priming.prime_ctx_stats(model) is None
+
+
+class TestBatchCacheAnchor:
+    """Batch caches expose ``offset`` as a 1-element array even at B==1.
+
+    The anchor probe used to require a plain int, so it found no anchor on
+    any ``BatchGenerator`` prefill and capture bailed silently — priming
+    never activated in the batch engine (#3079).
+    """
+
+    def test_anchor_unwraps_size_one_array_offset(self):
+        from mlx_lm.models.cache import BatchKVCache
+
+        entry = BatchKVCache([0])
+        assert type(entry.offset) is not int
+        anchor = prompt_priming._anchor([entry])
+        assert anchor is not None
+        assert anchor.offset == 0
+
+    def test_anchor_finds_batch_sub_cache_in_container(self):
+        """DeepSeek-V4 / GLM-5.2 wrap their layer caches in a CacheList."""
+        from mlx_lm.models.cache import BatchKVCache, CacheList
+
+        anchor = prompt_priming._anchor([CacheList(BatchKVCache([0]))])
+        assert anchor is not None
+        assert anchor.offset == 0
+
+    def test_anchor_skips_multi_row_batch_offset(self):
+        """A real B>1 cache has a vector offset: no singleton timeline to
+        anchor on, so capture must find nothing rather than guess a row."""
+        from mlx_lm.models.cache import BatchKVCache
+
+        assert prompt_priming._anchor([BatchKVCache([0, 0])]) is None
+
+    def test_anchor_view_tracks_the_live_offset(self):
+        from mlx_lm.models.cache import BatchKVCache
+
+        entry = BatchKVCache([0])
+        anchor = prompt_priming._anchor([entry])
+        entry.offset = entry.offset + 7
+        assert anchor.offset == 7
+
+    def test_batch_cache_prefill_primes_end_to_end(self, strict_model):
+        """Legacy single-head activation over the batch-engine cache shape:
+        capture through the seam, matching the one-shot oracle fold."""
+        model = strict_model
+        n = 9
+        tokens = _tokens(n, seed=32)
+        main_tok = _tokens(1, seed=33)
+        cache = _make_batch_cache(model)
+        _chunked_prefill(model, cache, tokens, [6, 3])
+        assert prompt_priming.prime_ctx_stats(model) == n - 1
+
+        model(main_tok[None, :], cache=cache, return_hidden=True)
+        primed = prompt_priming.take_primed(model, cache, main_tok)
+        assert primed is not None
+        mtp_cache, hist_offset = primed
+        assert hist_offset == n
+        assert mtp_cache[0].offset == n
+        assert prompt_priming._find_ctx(model) is None
+
+        ref_cache = _reference_head_cache(model, tokens, extra_tok=main_tok)
+        mx.eval([c.state for c in mtp_cache])
+        for (k, v), (rk, rv) in zip(_kv_entries(mtp_cache), _kv_entries(ref_cache)):
+            assert mx.allclose(k, rk, rtol=1e-4, atol=1e-4)
+            assert mx.allclose(v, rv, rtol=1e-4, atol=1e-4)
+
+
+class TestHookFallthrough:
+    """``mtp_take_primed`` is registered on the class but answered by only
+    some builds: the DeepSeek-V4 patch registers it unconditionally and
+    returns None for everything that is not DSpark. Taking that None as the
+    final answer made the generic seam unreachable, so priming was
+    structurally dead for legacy single-head MTP models (#3079).
+    """
+
+    def _prefill_and_activate(self, model, n=9, seed=34):
+        tokens = _tokens(n, seed=seed)
+        main_tok = _tokens(1, seed=seed + 1)
+        cache = _make_cache(model)
+        _chunked_prefill(model, cache, tokens, [6, 3])
+        assert prompt_priming.prime_ctx_stats(model) == n - 1
+        # Activation forward runs with return_hidden=True: capture skips it.
+        model(main_tok[None, :], cache=cache, return_hidden=True)
+        return cache, main_tok, n
+
+    def _register_hook(self, model, monkeypatch, hook):
+        monkeypatch.setattr(
+            type(model), "mtp_take_primed", hook, raising=False
+        )
+
+    def test_declining_hook_falls_through_to_generic_seam(
+        self, model, monkeypatch
+    ):
+        self._register_hook(model, monkeypatch, lambda self, cache, tok: None)
+        cache, main_tok, n = self._prefill_and_activate(model)
+        primed = prompt_priming.take_primed(model, cache, main_tok)
+        assert primed is not None
+        assert primed[1] == n
+        assert prompt_priming._find_ctx(model) is None
+
+    def test_owning_hook_result_is_returned(self, model, monkeypatch):
+        """A hook that answers owns the whole seam: its result passes
+        through and the generic context is left for it to manage."""
+        sentinel = (["head-cache"], 123)
+        self._register_hook(
+            model, monkeypatch, lambda self, cache, tok: sentinel
+        )
+        cache, main_tok, _ = self._prefill_and_activate(model)
+        assert prompt_priming.take_primed(model, cache, main_tok) is sentinel
+        assert prompt_priming._find_ctx(model) is not None
+
+    def test_fallthrough_ignores_foreign_ctx(self, model, monkeypatch):
+        """Hosts that share the slot (inkling's sliding-window context) pop
+        it before declining. If one ever forgets, the generic seam must not
+        adopt a context it did not build."""
+
+        class _ForeignCtx:
+            pass
+
+        self._register_hook(model, monkeypatch, lambda self, cache, tok: None)
+        cache, main_tok, _ = self._prefill_and_activate(model)
+        setattr(model, prompt_priming._CTX_ATTR, _ForeignCtx())
+        assert prompt_priming.take_primed(model, cache, main_tok) is None
 
 
 class TestActivationHandoff:
