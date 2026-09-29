@@ -162,7 +162,12 @@ class _FakeScheduler:
         self._prefill_transient_tracker = MagicMock()
 
     def preflight_or_raise(
-        self, *, num_prompt_tokens, cached_tokens=0, request_id=None
+        self,
+        *,
+        num_prompt_tokens,
+        cached_tokens=0,
+        request_id=None,
+        text_only=False,
     ):
         if num_prompt_tokens > self.boundary:
             raise PrefillMemoryExceededError(
@@ -230,7 +235,7 @@ class _FakePool:
     async def get_engine(self, model_id, force_lm=False):
         return self._engine
 
-    async def _unload_engine(self, model_id, *, reason="unspecified", source=None):
+    async def _unload_engine(self, model_id):
         self.unloaded.append(model_id)
 
     def get_entry(self, model_id):

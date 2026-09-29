@@ -50,6 +50,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
     let mcp: MCPSettings?
+    let usage: UsageSettings?
 
     struct ServerSettings: Codable, Equatable, Sendable {
         let host: String
@@ -127,6 +128,21 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         /// What oMLX asked Metal to allow at start (static ceiling clamped
         /// below physical RAM). Kernel cap below this = red warning.
         let omlxWiredLimitRequestBytes: Int64?
+        /// Ceiling each memory guard tier would set right now, keyed by tier.
+        var memoryGuardPreview: [String: MemoryGuardTierPreview]? = nil
+    }
+
+    /// One tier of `system.memory_guard_preview` (server-side enforcer math).
+    struct MemoryGuardTierPreview: Codable, Equatable, Sendable {
+        let reserveBytes: Int64?
+        let freeBytes: Int64?
+        let inactiveBytes: Int64?
+        let otherAppsBytes: Int64?
+        let staticBytes: Int64?
+        let dynamicBytes: Int64?
+        let metalCapBytes: Int64?
+        let ceilingBytes: Int64?
+        let binding: String?
     }
 
     /// Mirrors `omlx.settings.HuggingFaceSettings`. Empty string means
@@ -174,6 +190,14 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     /// Code, OpenClaw, Hermes, …). Empty / nil means no MCP server is wired.
     struct MCPSettings: Codable, Equatable, Sendable {
         let configPath: String?
+    }
+
+    /// Mirrors `omlx.settings.UsageSettings`. `usage_history` switches the
+    /// local hourly serving history behind Status → Usage History. Patched
+    /// via the flat `usage_history` key; the server applies it live and keeps
+    /// the existing usage.sqlite3 when it is turned off.
+    struct UsageSettings: Codable, Equatable, Sendable {
+        let usageHistory: Bool?
     }
 
     /// Mirrors `omlx.settings.ModelScopeSettings`. Empty string means
@@ -237,6 +261,11 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// the server (`global_settings.mcp.config_path = None`). Shared across
     /// every integration launcher.
     var mcpConfig: String? = nil
+
+    /// Record local usage history (Status → Usage History). Applied at
+    /// runtime; turning it off keeps the existing usage.sqlite3 so turning
+    /// it back on resumes the same history.
+    var usageHistory: Bool? = nil
 
     // Auth (PR 9)
     var skipApiKeyVerification: Bool? = nil

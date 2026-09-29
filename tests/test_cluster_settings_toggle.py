@@ -23,7 +23,6 @@ def test_distributed_opt_in_is_saved_for_the_next_restart():
                 request=routes.GlobalSettingsRequest(
                     distributed_inference_enabled=True
                 ),
-                http_request=MagicMock(),
                 is_admin=True,
             )
         )

@@ -244,7 +244,7 @@ def _guard_ready(scheduler: Any) -> bool:
 def _make_fits(scheduler: Any) -> Callable[[int], bool]:
     def fits(n: int) -> bool:
         try:
-            scheduler.preflight_or_raise(num_prompt_tokens=n)
+            scheduler.preflight_or_raise(num_prompt_tokens=n, text_only=True)
         except PrefillMemoryExceededError:
             return False
         return True
@@ -417,11 +417,7 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
             )
             for model_id in loaded_ids:
                 try:
-                    await engine_pool._unload_engine(
-                        model_id,
-                        reason="context_benchmark_prep",
-                        source=f"benchmark_model={request.model_id}",
-                    )
+                    await engine_pool._unload_engine(model_id)
                     logger.info("Context bench: unloaded %s", model_id)
                 except Exception as exc:
                     logger.warning(
@@ -753,11 +749,7 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
 
         # Phase 6: cleanup — unload the bench model (throughput parity).
         try:
-            await engine_pool._unload_engine(
-                request.model_id,
-                reason="context_benchmark_cleanup",
-                source=f"benchmark_model={request.model_id}",
-            )
+            await engine_pool._unload_engine(request.model_id)
             logger.info("Context bench: unloaded %s after run", request.model_id)
         except Exception as exc:
             logger.warning(
@@ -782,11 +774,7 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
         run.error_message = "Context benchmark cancelled by user"
         await _send_event(run, {"type": "error", "message": run.error_message})
         with contextlib.suppress(Exception):
-            await engine_pool._unload_engine(
-                request.model_id,
-                reason="context_benchmark_cancelled",
-                source=f"benchmark_model={request.model_id}",
-            )
+            await engine_pool._unload_engine(request.model_id)
 
     except Exception as exc:
         logger.error("Context bench error: %s", exc, exc_info=True)
@@ -794,8 +782,4 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
         run.error_message = str(exc)
         await _send_event(run, {"type": "error", "message": str(exc)})
         with contextlib.suppress(Exception):
-            await engine_pool._unload_engine(
-                request.model_id,
-                reason="context_benchmark_error",
-                source=f"benchmark_model={request.model_id}",
-            )
+            await engine_pool._unload_engine(request.model_id)

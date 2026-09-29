@@ -19,15 +19,9 @@ async def test_active_model_unload_returns_accepted_until_quiescent():
     pool = MagicMock()
     pool.get_entry.return_value = entry
     pool.request_unload = AsyncMock(return_value=False)
-    request = MagicMock()
-    request.client.host = "testclient"
-    request.headers = {}
-    request.url.path = "/api/models/model-a/unload"
 
     with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
-        response = await admin_routes.unload_model(
-            "model-a", request=request, is_admin=True
-        )
+        response = await admin_routes.unload_model("model-a", is_admin=True)
 
     assert response.status_code == 202
     assert json.loads(response.body) == {
@@ -36,12 +30,7 @@ async def test_active_model_unload_returns_accepted_until_quiescent():
         "message": "Aborting active requests before unloading model-a",
     }
     pool.request_unload.assert_awaited_once_with(
-        "model-a",
-        reason="manual admin unload",
-        source=(
-            "path=/api/models/model-a/unload client=testclient "
-            "ua='-' referer='-'"
-        ),
+        "model-a", reason="manual admin unload"
     )
 
 
@@ -53,15 +42,9 @@ async def test_idle_model_unload_returns_completed():
     pool = MagicMock()
     pool.get_entry.return_value = entry
     pool.request_unload = AsyncMock(return_value=True)
-    request = MagicMock()
-    request.client.host = "testclient"
-    request.headers = {}
-    request.url.path = "/api/models/model-a/unload"
 
     with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
-        response = await admin_routes.unload_model(
-            "model-a", request=request, is_admin=True
-        )
+        response = await admin_routes.unload_model("model-a", is_admin=True)
 
     assert response == {
         "status": "ok",

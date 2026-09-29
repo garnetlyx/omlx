@@ -30,6 +30,14 @@ def _spm_decoder(strip_space=True):
 
 
 class _ByteFallbackTokenizer:
+
+    def __len__(self):
+        return max(self.vocab.values()) + 1
+
+    def convert_ids_to_tokens(self, ids):
+        reverse = {v: k for k, v in self.vocab.items()}
+        return [reverse[i] for i in ids]
+
     clean_up_tokenization_spaces = False
     vocab = {
         "<pad>": 0,
@@ -54,6 +62,14 @@ class _ByteFallbackTokenizer:
 
 
 class _BpeTokenizer:
+
+    def __len__(self):
+        return max(self.vocab.values()) + 1
+
+    def convert_ids_to_tokens(self, ids):
+        reverse = {v: k for k, v in self.vocab.items()}
+        return [reverse[i] for i in ids]
+
     clean_up_tokenization_spaces = False
     vocab = {"A": 0, "B": 1}
 
@@ -70,6 +86,14 @@ class BPEStreamingDetokenizer:
 
 
 class _MlxVlmBpeTokenizer:
+
+    def __len__(self):
+        return max(self.vocab.values()) + 1
+
+    def convert_ids_to_tokens(self, ids):
+        reverse = {v: k for k, v in self.vocab.items()}
+        return [reverse[i] for i in ids]
+
     clean_up_tokenization_spaces = False
 
     def __init__(self, vocab):
@@ -89,13 +113,9 @@ class _ExplicitNoDetokenizer:
 
 
 def _bpe_byte_chars(*byte_values):
-    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+    from mlx_lm.tokenizer_utils import _byte_decoder
 
-    BPEStreamingDetokenizer.make_byte_decoder()
-    byte_encoder = {
-        byte_value: char
-        for char, byte_value in BPEStreamingDetokenizer._byte_decoder.items()
-    }
+    byte_encoder = {byte_value: char for char, byte_value in _byte_decoder().items()}
     return [byte_encoder[byte_value] for byte_value in byte_values]
 
 
@@ -206,6 +226,48 @@ class TestCreateStreamingDetokenizer:
         detokenizer.add_token(1)
 
         assert detokenizer.last_segment == ""
+
+    def test_decoder_aware_detokenizer_scans_the_vocabulary_once(self, tmp_path):
+        _write_json(tmp_path / "tokenizer.json", {"decoder": {"type": "ByteLevel"}})
+        tokenizer = _MlxVlmBpeTokenizer({"A": 0, "B": 1})
+        scans = []
+        convert = tokenizer.convert_ids_to_tokens
+        tokenizer.convert_ids_to_tokens = lambda ids: (scans.append(len(ids)), convert(ids))[1]
+
+        first = create_streaming_detokenizer(tokenizer, model_path=tmp_path)
+        second = create_streaming_detokenizer(tokenizer, model_path=tmp_path)
+
+        # One vocabulary conversion; each request still gets its own instance
+        # with fresh streaming state, sharing only the immutable token table.
+        assert scans == [2]
+        assert first is not second
+        assert first.tokenmap is second.tokenmap
+        first.add_token(0)
+        first.add_token(1)
+        first.finalize()
+        assert first.text == "AB"
+        assert second.tokens == [] and second.text == ""
+        second.add_token(1)
+        second.finalize()
+        assert second.text == "B"
+        assert first.text == "AB"
+
+    def test_unhashable_tokenizer_still_gets_fresh_detokenizers(self, tmp_path):
+        _write_json(tmp_path / "tokenizer.json", {"decoder": {"type": "ByteLevel"}})
+
+        class _Unhashable(_MlxVlmBpeTokenizer):
+            __hash__ = None
+
+        tokenizer = _Unhashable({"A": 0, "B": 1})
+        first = create_streaming_detokenizer(tokenizer, model_path=tmp_path)
+        second = create_streaming_detokenizer(tokenizer, model_path=tmp_path)
+
+        assert first is not second
+        assert first.tokenmap is not second.tokenmap
+        first.add_token(0)
+        first.finalize()
+        assert first.text == "A"
+        assert second.text == ""
 
     def test_explicit_none_detokenizer_without_model_path_stays_none(self):
         assert create_streaming_detokenizer(_ExplicitNoDetokenizer()) is None

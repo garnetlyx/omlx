@@ -10,7 +10,6 @@ end-to-end merge behaviour is covered in
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import omlx.server as server
 from omlx.settings import GlobalSettings, MCPSettings
@@ -122,9 +121,7 @@ class TestAdminApiExposeTools:
 
         request = admin_routes.GlobalSettingsRequest(mcp_expose_tools=False)
         result = asyncio.run(
-            admin_routes.update_global_settings(
-                request=request, http_request=MagicMock(), is_admin=True
-            )
+            admin_routes.update_global_settings(request=request, is_admin=True)
         )
         assert result["success"] is True
         assert gs.mcp.expose_tools is False
@@ -146,9 +143,7 @@ class TestAdminApiExposeTools:
 
         request = admin_routes.GlobalSettingsRequest()
         result = asyncio.run(
-            admin_routes.update_global_settings(
-                request=request, http_request=MagicMock(), is_admin=True
-            )
+            admin_routes.update_global_settings(request=request, is_admin=True)
         )
         assert result["success"] is True
         assert gs.mcp.expose_tools is True
