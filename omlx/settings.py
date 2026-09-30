@@ -1533,6 +1533,11 @@ class GlobalSettings:
 
     def _save_data(self, data: dict[str, Any]) -> None:
         settings_file = self.base_path / "settings.json"
+        # Resolve a symlinked settings.json to its real target so the atomic
+        # temp+replace below never swaps the symlink for a regular file
+        # (managed deployments symlink ~/.omlx/settings.json into a config
+        # repo; replacing it silently decouples the two files).
+        settings_file = Path(os.path.realpath(settings_file))
         # Write to a temp file and rename so a crash or a concurrent
         # writer can never leave a torn settings.json (same pattern as
         # ModelSettingsManager._save). The rename also carries the temp

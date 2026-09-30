@@ -806,8 +806,12 @@ class ModelSettingsManager:
 
         # Write to temp file first, then rename for atomicity. The pid in
         # the temp name keeps concurrent processes from sharing a temp path
-        # and renaming each other's partial writes into place.
-        temp_file = self.settings_file.with_name(
+        # and renaming each other's partial writes into place. Resolve a
+        # symlinked settings file to its real target first: replacing the
+        # symlink with a regular file would silently decouple a managed
+        # deployment's config symlink.
+        settings_file = Path(os.path.realpath(self.settings_file))
+        temp_file = settings_file.with_name(
             f"{self.settings_file.name}.{os.getpid()}.tmp"
         )
         try:
@@ -816,7 +820,7 @@ class ModelSettingsManager:
                 f.flush()
                 os.fsync(f.fileno())
 
-            temp_file.replace(self.settings_file)
+            temp_file.replace(settings_file)
             logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
