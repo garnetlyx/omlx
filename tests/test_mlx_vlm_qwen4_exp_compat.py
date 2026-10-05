@@ -267,9 +267,25 @@ def test_qwen4_resident_ple_fuses_packed_shards_exactly():
     indices = mx.array([[0, 9, 17, 31, 9]], dtype=mx.int32)
     expected = embedding(indices)
     mx.eval(expected)
+    scales_dtype = embedding.shards[0].scales.dtype
+    loads = []
 
-    assert embedding.fuse_quantized_shards() is True
-    assert embedding.fuse_quantized_shards() is False
+    def load_sources():
+        loads.append(1)
+        # Reloaded copies with another scales dtype must not replace the shards.
+        return [
+            SimpleNamespace(
+                weight=shard.weight,
+                scales=shard.scales.astype(mx.float16),
+                biases=shard.biases,
+            )
+            for shard in embedding.shards
+        ]
+
+    assert embedding.fuse_quantized_shards(load_sources) is True
+    assert embedding.fused.scales.dtype == scales_dtype
+    assert embedding.fuse_quantized_shards(load_sources) is False
+    assert len(loads) == 1
     assert embedding.shards == []
     # The fused arm performs one device gather and no longer consults the host
     # shard boundaries after load.
@@ -475,14 +491,24 @@ def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplo
             )
             for key, value in canonical.items()
         }
+        # A direct gamma below 0.5 with more mantissa bits than its BF16
+        # residual can keep (0.2001953125 - 1 needs nine).
+        fp32_key = "mtp.pre_fc_norm_embedding.weight"
+        shifted[fp32_key] = mx.array(
+            [0.2001953125, 0.25, 0.30078125, 0.3515625], dtype=mx.bfloat16
+        )
 
         with caplog.at_level("INFO"):
             result = Model.sanitize(model, dict(shifted))
 
+        # Every other gamma recentres exactly in BF16 and keeps that dtype.
         for key in target_keys:
-            assert result[key].dtype == mx.float32
+            assert result[key].dtype == (
+                mx.float32 if key == fp32_key else mx.bfloat16
+            )
             assert mx.array_equal(
-                1.0 + result[key], shifted[key].astype(mx.float32)
+                1.0 + result[key].astype(mx.float32),
+                shifted[key].astype(mx.float32),
             ).item()
 
         gated_key = "language_model.model.layers.0.linear_attn.norm.weight"

@@ -682,6 +682,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_model: str | None = None
     integrations_hermes_model: str | None = None
     integrations_pi_model: str | None = None
+    integrations_dsh_model: str | None = None
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
     ) = None
@@ -1579,6 +1580,15 @@ _ms_downloader = None
 _oq_manager = None
 _hf_uploader = None
 
+# One save at a time: _save_data writes through a pid-named temp file.
+_settings_save_lock = asyncio.Lock()
+
+
+async def _save_global_settings_async(global_settings) -> None:
+    """Persist global settings off the event loop, serialized."""
+    async with _settings_save_lock:
+        await asyncio.to_thread(global_settings.save)
+
 
 def set_admin_getters(
     state_getter,
@@ -2016,7 +2026,7 @@ async def setup_api_key(
 
     # Persist to file
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
@@ -2138,7 +2148,7 @@ async def create_sub_key(
     global_settings.auth.sub_keys.append(entry)
 
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         # Rollback
         global_settings.auth.sub_keys.pop()
@@ -2172,7 +2182,7 @@ async def delete_sub_key(
         if sk.key and compare_keys(request.key, sk.key):
             removed = global_settings.auth.sub_keys.pop(i)
             try:
-                global_settings.save()
+                await _save_global_settings_async(global_settings)
             except Exception as e:
                 global_settings.auth.sub_keys.insert(i, removed)
                 raise HTTPException(
@@ -4691,6 +4701,7 @@ def _global_settings_response(global_settings):
             "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
+            "dsh_model": global_settings.integrations.dsh_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
             "markitdown_enabled": global_settings.integrations.markitdown_enabled,
             "markitdown_expose_model": global_settings.integrations.markitdown_expose_model,
@@ -4818,6 +4829,8 @@ async def update_global_settings(
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
     previous_embedding_batch_size: int | None = None
+    pending_max_concurrent_requests: int | None = None
+    previous_max_concurrent_requests: int | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -5044,11 +5057,20 @@ async def update_global_settings(
             f"{'enabled' if request.memory_prefill_memory_guard else 'disabled'}"
         )
 
-    # Apply scheduler settings (restart required)
+    # Apply scheduler settings
     if request.max_concurrent_requests is not None:
-        global_settings.scheduler.max_concurrent_requests = (
+        if (
             request.max_concurrent_requests
-        )
+            != global_settings.scheduler.max_concurrent_requests
+        ):
+            # Applied to engines only after validate() and save() succeed.
+            previous_max_concurrent_requests = (
+                global_settings.scheduler.max_concurrent_requests
+            )
+            global_settings.scheduler.max_concurrent_requests = (
+                request.max_concurrent_requests
+            )
+            pending_max_concurrent_requests = request.max_concurrent_requests
 
     # Apply embedding batch size setting (Live for loaded embedding engines)
     if request.embedding_batch_size is not None:
@@ -5563,6 +5585,9 @@ async def update_global_settings(
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
         integrations_changed = True
+    if "integrations_dsh_model" in request.model_fields_set:
+        global_settings.integrations.dsh_model = request.integrations_dsh_model
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -5765,17 +5790,36 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    if pending_max_concurrent_requests is not None:
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            await pool.apply_max_concurrent_requests(pending_max_concurrent_requests)
+        runtime_applied.append("max_concurrent_requests")
+        logger.info(
+            f"Max concurrent requests set to {pending_max_concurrent_requests} (live)"
+        )
 
     if pending_embedding_batch_size is not None:
         from ..server import _server_state
@@ -5922,7 +5966,7 @@ async def get_logs(
     log_dir = global_settings.logging.get_log_dir(global_settings.base_path)
 
     # Get available log files
-    available_files = _get_available_log_files(log_dir)
+    available_files = await asyncio.to_thread(_get_available_log_files, log_dir)
 
     # Determine which file to read
     if file:
@@ -5938,7 +5982,7 @@ async def get_logs(
 
     # Read log content
     if log_file.exists():
-        content, total_lines = _tail_file(log_file, lines)
+        content, total_lines = await asyncio.to_thread(_tail_file, log_file, lines)
     else:
         content = ""
         total_lines = 0
@@ -5968,6 +6012,7 @@ def _get_engine_info() -> dict:
 
     engines = {}
     packages = {
+        "mlx": "https://github.com/ml-explore/mlx",
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
         "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
@@ -6796,8 +6841,11 @@ def _build_active_models_data() -> dict:
         idle_seconds: float | None = None
         ttl_remaining_seconds: float | None = None
 
-        if is_loaded and last_access is not None and last_access > 0:
-            idle_seconds = max(0.0, time.time() - last_access)
+        if is_loaded:
+            if active_requests or waiting_requests or getattr(entry, "in_use", 0) > 0:
+                idle_seconds = 0.0
+            elif last_access is not None and last_access > 0:
+                idle_seconds = max(0.0, time.time() - last_access)
 
         # Determine effective TTL: per-model ttl_seconds first, then global idle_timeout.
         effective_ttl: int | None = None

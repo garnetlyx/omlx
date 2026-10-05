@@ -375,7 +375,10 @@ class _StoreCacheGate:
 # Import tiered cache components
 try:
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
-    from .cache.paged_ssd_cache import PagedSSDCacheManager
+    from .cache.paged_ssd_cache import (
+        PagedSSDCacheManager,
+        numerics_revision_for_model,
+    )
     from .memory_monitor import (
         MemoryMonitor,
         collect_kv_layer_specs,
@@ -387,6 +390,7 @@ try:
     HAS_TIERED_CACHE = True
 except ImportError:
     PagedSSDCacheManager = None
+    numerics_revision_for_model = None
     BoundarySnapshotSSDStore = None
     MemoryMonitor = None
     collect_kv_layer_specs = None
@@ -625,11 +629,12 @@ def _row_drifted(current_lps, expected_lps) -> bool:
     Two distinct empty lists are equivalent — the #1799 normalisation mints
     fresh ``[]`` objects every step — so only differing content counts. The
     caller's identity check is the steady-state fast path; this only runs
-    past it.
+    past it. mlx-lm stores each row as a tuple while the registry keeps a
+    list, so compare contents rather than container types.
     """
     if not current_lps and not expected_lps:
         return False
-    return current_lps != expected_lps
+    return tuple(current_lps) != tuple(expected_lps)
 
 
 def _log_drift_correction(uids, slot_count) -> None:
@@ -685,13 +690,6 @@ def _realigned_rows(model, uids, cur_samplers, cur_lps):
 
 def _omlx_realign_generation_batch_rows(self) -> None:
     """Realign positional row state with ``uids`` before any decode path reads it."""
-    if self.logits_processors is None:
-        self.logits_processors = []
-    else:
-        self.logits_processors = [
-            procs if procs is not None else [] for procs in self.logits_processors
-        ]
-
     uids = getattr(self, "uids", None) or []
     if not uids:
         return
@@ -766,22 +764,8 @@ def _patched_generation_batch_step(self):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         _bind_step_rope_deltas(model, mx.array(deltas), self.uids)
 
-    # Defensive: mlx-lm's GenerationBatch._step does `any(self.logits_processors)`
-    # and `for p in self.logits_processors[e]`, both of which crash when a row
-    # slot is None.  Normalise the whole list AND every per-row slot to [] here,
-    # at the single consumption chokepoint, so the original step and the
-    # grammar-accept loop below are both safe regardless of slot origin.
-    #
-    # The insert call sites already wrap each request's processors as a list,
-    # but that is not enough: on a heterogeneous continuous-batch merge,
-    # mlx-lm's GenerationBatch.extend() re-introduces None slots via
-    # `if not any(self.logits_processors): self.logits_processors =
-    # [None] * len(self.uids)`.  `any([[], []])` is False, so empty-list slots
-    # collapse back to None whenever a batch with no *active* processor merges
-    # with a grammar-constrained one (e.g. a plain chat request joining a batch
-    # that is serving a structured json_schema request).  Per-row normalisation
-    # at this chokepoint is the only place that covers both insert and merge.
-    # See #934 / #1747.
+    # Realign sampler/processor rows with uids before the original step and
+    # the grammar-accept loop read them by position.
     _omlx_realign_generation_batch_rows(self)
 
     # Must run after the realignment: it reads self.logits_processors[e] as
@@ -794,43 +778,6 @@ def _patched_generation_batch_step(self):
 
 GenerationBatch._omlx_realign_rows = _omlx_realign_generation_batch_rows
 GenerationBatch._step = _patched_generation_batch_step
-
-
-# ---------------------------------------------------------------------------
-# Monkey-patch GenerationBatch.filter to keep logits_processors aligned with
-# uids.  mlx-lm's filter only reindexes the processor list when at least one
-# row has an active processor:
-#
-#     if any(self.logits_processors):
-#         self.logits_processors = [self.logits_processors[idx] for idx in keep]
-#
-# There is no else branch (unlike the prompt-batch class, which resets to
-# ``[[]] * len(keep)``), so when every slot is empty — the normal state after
-# serving requests without per-request processors — the stale list survives
-# while uids/tokens shrink.  A later extend() then appends the next request's
-# processors BEHIND its own row index: the row reads a leftover empty slot and
-# the real processor (thinking budget, grammar constraint) is silently never
-# applied.  Which requests are affected depends on insertion/removal order,
-# and alignment self-heals once the broken request finishes, so the symptom
-# is an intermittently ignored thinking_budget or grammar.  See #934/#1747
-# for the sibling None-slot collapse handled in _patched_generation_batch_step.
-_original_generation_batch_filter = GenerationBatch.filter
-
-
-def _patched_generation_batch_filter(self, keep):
-    lps = self.logits_processors
-    lps_inert = not lps or not any(lps)
-    if lps is None:
-        # ``any(None)`` inside the original filter raises TypeError.
-        self.logits_processors = []
-    _original_generation_batch_filter(self, keep)
-    if lps_inert:
-        # Original filter skipped the reindex; reset to one empty slot per
-        # surviving row so extend() appends at the correct indices.
-        self.logits_processors = [[] for _ in keep]
-
-
-GenerationBatch.filter = _patched_generation_batch_filter
 
 
 _TQ_SINGLETON_CACHE_TYPE: type[Any] | None = None
@@ -1046,9 +993,7 @@ def _patched_ppb_split(self, indices):
         new_batch.prefill_step_size = self.prefill_step_size
         new_batch.samplers = self.samplers
         new_batch.fallback_sampler = self.fallback_sampler
-        # Defensive: normalise None → [] to avoid mlx-lm crash in _step
-        lps = self.logits_processors if self.logits_processors is not None else []
-        new_batch.logits_processors = lps
+        new_batch.logits_processors = self.logits_processors
         new_batch.stop_sequences = self.stop_sequences
         new_batch.max_tokens = self.max_tokens
         if hasattr(self, "_omlx_glm_dsa_adaptive_prefill"):
@@ -1654,6 +1599,32 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
     return max(1, next_n)
 
 
+def _glm5_next_prefill_floor() -> int:
+    """Return the wide-prefill floor for GLM-5.3 (0 when the host cannot use it).
+
+    Wider chunks require the native sparse MLA path. NAX hosts also need the
+    tensor-unit sparse MLA: its attention cost per query does not depend on
+    the chunk, so a wider chunk feeds the MoE more rows.
+    """
+    try:
+        from .custom_kernels.glm_moe_dsa import fast
+        from .custom_kernels.nax import is_nax_available
+        from .patches.glm_moe_dsa.sparse_mla_nax import nax_sparse_mla_available
+        from .settings import get_system_memory
+
+        if not fast.is_native_available() or not fast.has_symbol(
+            "glm_dsa_sparse_mla_attention"
+        ):
+            return 0
+        if get_system_memory() < 64 * 1024**3:
+            return 0
+        if not is_nax_available() or nax_sparse_mla_available():
+            return 4096
+    except Exception:
+        logger.debug("glm5_next prefill floor probe failed", exc_info=True)
+    return 0
+
+
 def _mimo_fused_full_attention() -> bool:
     """True when MiMo's 192/128 full-attention layers run a fused kernel.
 
@@ -1884,6 +1855,48 @@ class _BoundarySnapshotProvider:
             with suppress(OSError):
                 staged_path.unlink()
             return False
+
+    @classmethod
+    def stage_and_commit(
+        cls,
+        *,
+        store: Any,
+        paged_ssd_manager: Any,
+        request_id: str,
+        token_count: int,
+        snapshot: list[dict[str, Any]],
+        source_block_hash: bytes,
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+        layer_meta_states: list[Any] | None,
+        model_name: str,
+        block_size: int,
+    ) -> bool:
+        """Stage one extracted recurrent snapshot and promote it to a sidecar."""
+        if store is None or paged_ssd_manager is None:
+            return False
+        if not store.save(
+            request_id,
+            token_count,
+            snapshot,
+            lambda extracted: (extracted, None),
+            block_size=block_size,
+        ):
+            return False
+        provider = cls(
+            store=store,
+            request_id=request_id,
+            valid_tcs=[token_count],
+            in_memory_snapshots={},
+            paged_ssd_manager=paged_ssd_manager,
+        )
+        return provider.commit_gdn_checkpoint(
+            token_count,
+            source_block_hash,
+            layer_cache_types=list(layer_cache_types or []),
+            layer_meta_states=layer_meta_states,
+            model_name=model_name,
+            block_size=block_size,
+        )
 
 
 class Scheduler:
@@ -2698,23 +2711,25 @@ class Scheduler:
                             "Async store_cache for %s raised: %s", request_id, exc
                         )
             try:
-                # Run batch_generator.remove on the inference thread.
-                try:
-                    _safe_sync_stream(self._stream)
-                    self._remove_uid_from_active_batch(uid)
-                    if hasattr(self.model, "unregister_rope_delta"):
-                        self.model.unregister_rope_delta(uid)
-                except Exception as e:
-                    logger.warning(
-                        "Deferred batch_generator.remove(uid=%s) failed: %s",
-                        uid,
-                        e,
-                    )
-                # Cleanup uid maps now that the slot is reclaimable.
-                _unregister_uid_row(self.model, uid)
-                if uid in self.uid_to_request_id:
+                # A batch generator reset drops this row and the next generator
+                # reuses uids from 0. Touch the uid only while this request owns it.
+                if self.uid_to_request_id.get(uid) == request_id:
+                    # Run batch_generator.remove on the inference thread.
+                    try:
+                        _safe_sync_stream(self._stream)
+                        self._remove_uid_from_active_batch(uid)
+                        if hasattr(self.model, "unregister_rope_delta"):
+                            self.model.unregister_rope_delta(uid)
+                    except Exception as e:
+                        logger.warning(
+                            "Deferred batch_generator.remove(uid=%s) failed: %s",
+                            uid,
+                            e,
+                        )
+                    # Cleanup uid maps now that the slot is reclaimable.
+                    _unregister_uid_row(self.model, uid)
                     del self.uid_to_request_id[uid]
-                if request_id in self.request_id_to_uid:
+                if self.request_id_to_uid.get(request_id) == uid:
                     del self.request_id_to_uid[request_id]
                 self._inflight_store_futures.pop(request_id, None)
                 self._inflight_store_info.pop(request_id, None)
@@ -2969,30 +2984,16 @@ class Scheduler:
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
                     return 0
-            # Wider GLM chunks require the native sparse MLA path.
-            is_glm5_next = model_type.startswith("glm5_next")
-            if is_glm5_next:
-                from .custom_kernels.glm_moe_dsa import fast
-
-                if not fast.is_native_available() or not fast.has_symbol(
-                    "glm_dsa_sparse_mla_attention"
-                ):
-                    return 0
-            if is_qwen35 or is_qwen4 or is_glm5_next:
+            if model_type.startswith("glm5_next"):
+                return _glm5_next_prefill_floor()
+            if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
-                from .patches.glm_moe_dsa.sparse_mla_nax import (
-                    nax_sparse_mla_available,
-                )
                 from .settings import get_system_memory
 
                 if get_system_memory() < 64 * 1024**3:
                     return 0
+                # NAX hosts keep the default chunk.
                 if not is_nax_available():
-                    return 4096
-                # NAX hosts keep the default chunk, except GLM-5.3 with the
-                # tensor-unit sparse MLA: its attention cost per query does not
-                # depend on the chunk, so a wider chunk feeds the MoE more rows.
-                if is_glm5_next and nax_sparse_mla_available():
                     return 4096
             if self._is_mimo_hybrid():
                 from .custom_kernels.nax import is_nax_available
@@ -4007,7 +4008,9 @@ class Scheduler:
                         request.prompt_cache = prompt_cache
                     request.cached_tokens += processed_tokens
                     request.remaining_tokens = tokens[processed_tokens:]
-                    request._prefill_resumed = True
+                # Admission already passed. A resumed run can pause again
+                # before its first chunk and must not be re-admitted.
+                request._prefill_resumed = True
                 raise
 
             # Keep token and embedding slices aligned at the final prefill chunk.
@@ -4476,6 +4479,41 @@ class Scheduler:
             limits.append(int(hard_limit * headroom))
         return min(limits) if limits else 0
 
+    def _hot_cache_limit_factor(self) -> float:
+        """Least a prefill limit rises per byte the hot-cache reservation drops.
+
+        Each limit is (ceiling - reservation) times one of these ratios.
+        """
+        headroom = getattr(self, "_prefill_headroom_safety", None)
+        if headroom is None:
+            headroom = Scheduler._PREFILL_HEADROOM_SAFETY
+        ratios = [headroom, self._prefill_abort_margin]
+        hard_limit = self._memory_hard_limit_bytes
+        watermark = self._memory_hard_watermark_bytes
+        if hard_limit > 0 and watermark > 0:
+            ratios.append(watermark / hard_limit)
+        return max(0.0, min(1.0, *ratios))
+
+    def _releasable_hot_cache_credit(self, own_prefix_bytes: int) -> int:
+        """Limit the hot cache gives back once a request is admitted.
+
+        Route preflight cannot protect the request's prefix blocks yet, so it
+        counts this instead of releasing hot cache. ``own_prefix_bytes``
+        bounds the request's own cached prefix, which stays protected.
+        """
+        reserved = self._memory_hot_cache_reserved_bytes
+        if reserved <= 0:
+            return 0
+        releasable = getattr(
+            getattr(self.config, "hot_cache_budget", None), "releasable_bytes", None
+        )
+        if callable(releasable):
+            held = releasable(self.get_active_hot_cache_block_hashes())
+        else:
+            held = self._hot_cache_cpu_bytes()
+        held = min(held - own_prefix_bytes, reserved)
+        return int(max(0, held) * self._hot_cache_limit_factor())
+
     def _prefill_abort_description(self) -> tuple[int, int, float]:
         """Return (base cap, safety cap, margin) for diagnostics."""
         base_cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
@@ -4652,6 +4690,7 @@ class Scheduler:
                 current=current,
                 fmt=format_bytes,
                 tail="reduce context length",
+                hot_cache=getattr(self, "_memory_hot_cache_reserved_bytes", 0),
             )
             message = (
                 "Prefill context too large for available memory "
@@ -4921,6 +4960,7 @@ class Scheduler:
                 current=current,
                 fmt=format_bytes,
                 tail="reduce context length",
+                hot_cache=getattr(self, "_memory_hot_cache_reserved_bytes", 0),
             )
             logger.info(
                 "Prefill throttled for %s: chunk %d -> %d "
@@ -5148,13 +5188,16 @@ class Scheduler:
         return max(active, phys, 0)
 
     def get_active_hot_cache_block_hashes(self) -> set[bytes]:
-        """Return hot-cache block hashes owned by active in-flight requests."""
+        """Return hot-cache block hashes owned by admitted or queued requests."""
         manager = getattr(self, "paged_cache_manager", None)
         if manager is None:
             return set()
 
         hashes: set[bytes] = set()
-        active_requests = list(self.running.values()) + list(self.prefilling)
+        # A request paused for prefill eviction waits with its block table.
+        active_requests = (
+            list(self.running.values()) + list(self.prefilling) + list(self.waiting)
+        )
         for request in active_requests:
             block_table = getattr(request, "block_table", None)
             if block_table is None:
@@ -6848,12 +6891,8 @@ class Scheduler:
         self, sampling_params: SamplingParams, request: Any = None
     ) -> tuple[Callable[[mx.array], mx.array], list[Callable]]:
         """Build per-request sampler and logits processors."""
-        # Use omlx.utils.sampling.make_sampler instead of mlx_lm.sample_utils.
-        # The mlx-lm version decorates categorical_sampling and apply_* with
-        # @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state),
-        # which fails to advance the RNG state after the first call in this
-        # server environment. Identical prompts then produce identical output
-        # even at temperature > 1.
+        # omlx.utils.sampling.make_sampler carries the fused top-p/top-k and
+        # MTP acceptance metadata that mlx_lm.sample_utils does not.
         sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
@@ -6892,9 +6931,16 @@ class Scheduler:
         if suppress_processor is not None:
             logits_processors.append(suppress_processor)
 
-        # Add thinking budget processor for reasoning models
+        # Bare grammars constrain the answer from its first token. Forcing a
+        # thinking close into them can leave every logit masked to -inf. Only
+        # grammars compiled with a separate reasoning phase can use a budget.
+        grammar_allows_thinking = sampling_params.compiled_grammar is None or (
+            getattr(sampling_params.compiled_grammar, "_omlx_has_thinking_phase", False)
+            is True
+        )
         if (
-            sampling_params.thinking_budget is not None
+            grammar_allows_thinking
+            and sampling_params.thinking_budget is not None
             and request is not None
             and (
                 getattr(request, "needs_think_prefix", False)
@@ -6929,9 +6975,8 @@ class Scheduler:
                 logits_processors.append(processor)
 
         # Add grammar constraint processor for structured output.
-        # Phase awareness (thinking vs output) is handled by the compiled
-        # grammar itself via xgrammar structural tags, so we don't need
-        # think_end_ids here.
+        # Reasoning-aware grammars handle thinking/output phases through
+        # structural tags; bare grammars constrain output immediately.
         if sampling_params.compiled_grammar is not None:
             try:
                 from .api.grammar import GrammarConstraintProcessor
@@ -10827,6 +10872,7 @@ class Scheduler:
         # failed_ids excludes _inflight_store_futures ids, so snapshots the
         # async store worker still reads are left intact.
         for rid in failed_ids:
+            self._cleanup_specprefill(rid)
             self._drop_boundary_snapshots_for_request(rid)
             self._release_paged_cache_for_request(rid)
         # Reset batch generator only (cache is not corrupted). Every row dies
@@ -11068,11 +11114,12 @@ class Scheduler:
 
         The ladder itself lives in ``exceptions.describe_ceiling_binding``
         so engine-pool load refusals and DFlash's guard name the same
-        binding ceiling and the same knob. ``hard_limit`` here has the
-        hot-cache reservation already subtracted while the components are
-        raw; that offset shifts every component equally, so it does not
-        affect which one is binding.
+        binding ceiling and the same knob. ``hard_limit`` is the admission
+        line: the binding ceiling minus the hot-cache reservation and the
+        safety margin. The message names each part, because ``current``
+        excludes the hot cache while the components include it.
         """
+        hot_cache = getattr(self, "_memory_hot_cache_reserved_bytes", 0)
         binding_str, advice = describe_ceiling_binding(
             static=self._memory_static_ceiling_bytes,
             dynamic=self._memory_dynamic_ceiling_bytes,
@@ -11081,14 +11128,27 @@ class Scheduler:
             tier=self._memory_guard_tier,
             current=current,
             fmt=format_bytes,
-            tail="reduce context length",
+            tail=(
+                ["lower hot_cache_max_size", "reduce context length"]
+                if hot_cache > 0
+                else "reduce context length"
+            ),
+            hot_cache=hot_cache,
         )
+        scheduler_ceiling = self._memory_hard_limit_bytes
+        parts = [f"{binding_str} ceiling {format_bytes(scheduler_ceiling + hot_cache)}"]
+        if hot_cache > 0:
+            parts.append(f"hot cache {format_bytes(hot_cache)}")
+        if scheduler_ceiling > hard_limit:
+            parts.append(
+                f"safety margin {format_bytes(scheduler_ceiling - hard_limit)}"
+            )
 
         return (
             f"Prefill would require ~{format_bytes(estimated)} peak "
             f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-            f"but {binding_str} ceiling is {format_bytes(hard_limit)}. "
-            f"{advice}."
+            f"but the prefill limit is {format_bytes(hard_limit)} "
+            f"({' - '.join(parts)}). {advice}."
         )
 
     def preflight_or_raise(
@@ -11133,8 +11193,9 @@ class Scheduler:
 
             request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
 
+        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
         admission_limit = self._admission_limit_bytes()
-        if est.estimated > admission_limit:
+        if est.estimated - hot_cache_credit > admission_limit:
             message = self._format_rejection_message(
                 estimated=est.estimated,
                 current=current,
@@ -11159,6 +11220,7 @@ class Scheduler:
         safety_rejection = self._preflight_safety_rejection(
             est=est,
             current_usage_bytes=current,
+            hot_cache_credit=hot_cache_credit,
         )
         if safety_rejection is None:
             return
@@ -11214,13 +11276,15 @@ class Scheduler:
         if est is None:
             return None
 
+        # Evict models only for what the hot cache cannot give back.
+        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
         admission_limit = self._admission_limit_bytes()
-        if est.estimated > admission_limit:
+        if est.estimated - hot_cache_credit > admission_limit:
             return PrefillEvictionRequest(
                 request_id=request_id,
                 model_id=getattr(self.config, "model_name", ""),
                 current_bytes=int(current),
-                target_cap_bytes=int(admission_limit),
+                target_cap_bytes=int(admission_limit + hot_cache_credit),
                 predicted_transient_bytes=int(est.kv_exact + est.transient),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
@@ -11230,6 +11294,7 @@ class Scheduler:
         safety_rejection = self._preflight_safety_rejection(
             est=est,
             current_usage_bytes=current,
+            hot_cache_credit=hot_cache_credit,
         )
         if safety_rejection is None:
             return None
@@ -11238,7 +11303,7 @@ class Scheduler:
             request_id=request_id,
             model_id=getattr(self.config, "model_name", ""),
             current_bytes=int(current),
-            target_cap_bytes=int(safety_rejection.limit_bytes),
+            target_cap_bytes=int(safety_rejection.limit_bytes + hot_cache_credit),
             predicted_transient_bytes=max(
                 0, int(safety_rejection.estimated_bytes) - int(current)
             ),
@@ -11252,6 +11317,7 @@ class Scheduler:
         *,
         est: _AdmissionEstimate,
         current_usage_bytes: int,
+        hot_cache_credit: int = 0,
     ) -> _PreflightRejection | None:
         """Predict whether even the safety floor chunk cannot fit.
 
@@ -11268,7 +11334,7 @@ class Scheduler:
         kv_growth = est.kv_exact
         min_transient = est.transient
         estimated = int(current_usage_bytes) + kv_growth + min_transient
-        if estimated <= cap:
+        if estimated - hot_cache_credit <= cap:
             return None
 
         binding_str, advice = describe_ceiling_binding(
@@ -11288,6 +11354,7 @@ class Scheduler:
             current=current_usage_bytes,
             fmt=format_bytes,
             tail="reduce context length",
+            hot_cache=getattr(self, "_memory_hot_cache_reserved_bytes", 0),
         )
         message = (
             "Prefill context too large for available memory "
@@ -11495,6 +11562,8 @@ class Scheduler:
                 request.cached_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
+                # Indices were scored against the rejected cache's cached_tokens.
+                request.specprefill_indices = None
 
             # SpecPrefill requests must be alone in the batch (RoPE patching
             # affects the entire model). Also block scheduling if another
@@ -12036,16 +12105,6 @@ class Scheduler:
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
             #
-            # IMPORTANT: ``logits_processors`` MUST be passed as a per-row
-            # list (possibly empty), never None.  mlx-lm's
-            # GenerationBatch._step does ``for p in self.logits_processors[e]``
-            # in any branch where ``any(self.logits_processors)`` is True
-            # (e.g., heterogeneous merge with another row that has a
-            # processor).  A None slot crashes that loop with
-            # ``TypeError: 'NoneType' object is not iterable``, which then
-            # bubbles into the engine retry loop and presents as a hang.
-            # See vllm-mlx-patched commit 8d4052b for the same root cause
-            # in a sibling project, and #934 for the user-visible symptom.
             per_row_lps = list(logits_processors) if logits_processors else []
             # insert() merges the prompt cache into the batch KV caches with
             # lazy ops; keep them on the engine stream so the next decode
@@ -12970,6 +13029,10 @@ class Scheduler:
             self._boundary_snapshot_store.cleanup_all()
         self._boundary_snapshot_required = None
 
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
+
         # Clear stale VLM position state to prevent re-corruption on retry
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
@@ -13048,6 +13111,8 @@ class Scheduler:
         request._extracted_cache = None
         request._model_cache_config = None
         request.think_prefix_sent = False
+        # Indices were scored against the pre-reset cached_tokens.
+        request.specprefill_indices = None
 
     def _collect_corruption_retry_requests(self) -> list[Request]:
         """Every live request that must be re-prefilled after a cache reset.
@@ -14340,6 +14405,7 @@ class Scheduler:
                     layer_cache_types,
                     turboquant_kv_bits=turboquant_kv_bits,
                     cachelist_subtypes=cachelist_subtypes,
+                    numerics=numerics_revision_for_model(self.model),
                 )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)
@@ -14486,6 +14552,15 @@ class Scheduler:
                             dequantization_counter=lambda: (
                                 self._boundary_snapshot_store.gdn_state_dequantizations
                             ),
+                        )
+                        boundary_store = self._boundary_snapshot_store
+                        paged_ssd_manager = self.paged_ssd_cache_manager
+                        self.block_aware_cache.set_exact_gdn_checkpoint_writer(
+                            lambda **kwargs: _BoundarySnapshotProvider.stage_and_commit(
+                                store=boundary_store,
+                                paged_ssd_manager=paged_ssd_manager,
+                                **kwargs,
+                            )
                         )
                 except Exception as e:
                     logger.debug(
