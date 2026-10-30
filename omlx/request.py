@@ -158,6 +158,8 @@ class Request:
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
+    # Ordinary prefix reuse awaiting scheduling validation; None once recorded.
+    pending_prefix_cache_tokens: int | None = None
 
     # Memory-pressure requeue. The first ``requeued_output_tokens`` outputs
     # are folded into ``prompt_token_ids`` so re-admission prefills them;
@@ -323,6 +325,17 @@ class Request:
 
 
 @dataclass
+class TokenLogprob:
+    """Log probability of one generated token or of one alternative to it."""
+
+    token_id: int
+    text: str
+    token_bytes: List[int]
+    logprob: float
+    top: List["TokenLogprob"] = field(default_factory=list)
+
+
+@dataclass
 class RequestOutput:
     """
     Output for a single request after a generation step.
@@ -356,6 +369,8 @@ class RequestOutput:
 
     # Tool calls (for Harmony and other models with tool calling support)
     tool_calls: Optional[List[Dict[str, str]]] = None
+    # One entry per token in new_token_ids when the request asked for logprobs.
+    logprobs: Optional[List[TokenLogprob]] = None
     # Prefix cache stats
     cached_tokens: int = 0
     # Error message (set when engine encounters an unrecoverable error)

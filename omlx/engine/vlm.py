@@ -30,6 +30,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import itertools
 import json
 import logging
 import threading
@@ -45,6 +46,7 @@ from ..api.utils import (
     detect_and_strip_partial,
     remove_special_tokens_preserve_whitespace,
 )
+from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
@@ -53,6 +55,7 @@ from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
+from ..patches.muse_spark import model as muse_spark_model
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
@@ -78,6 +81,7 @@ from .base import (
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
+from .lfm3_speech import SPEECH_MODEL_TYPES, LFM3Speech
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +109,8 @@ OCR_MODEL_PROMPTS: Dict[str, str] = {
     "dots_ocr": "Convert this page to clean Markdown while preserving reading order.",
     "glm_ocr": "Text Recognition:",
 }
+# Unlimited-OCR-2 (DASH decoder) defaults to this prompt for any page count.
+UNLIMITED_OCR_2_PROMPT = "Multi page parsing."
 
 # Extra stop sequences for OCR models to prevent degeneration.
 # Many OCR models lack proper EOS handling and generate chat-turn
@@ -223,6 +229,10 @@ def _apply_minimax_m3_thinking_mode(
         template_kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
         template_kwargs["thinking_mode"] = "disabled"
+    elif str(template_kwargs.get("reasoning_effort", "")).strip().lower() == "none":
+        # MiniMax renders the effort level verbatim; "none" also turns
+        # thinking off, as the reference server does.
+        template_kwargs["thinking_mode"] = "disabled"
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
@@ -332,222 +342,6 @@ def _patch_video_processor_bug():
         pass
 
     _video_processor_patched = True
-
-
-_torch_free_ip_patched = False
-
-
-def _patch_torch_free_image_processor():
-    """Route mlx-vlm OCR processors around torch-gated AutoImageProcessor.
-
-    transformers 5.5+ ships ``AutoImageProcessor`` as a ``DummyObject`` that
-    raises ``ImportError`` on attribute access without torch+torchvision
-    installed. mlx-vlm's ``GlmOcrProcessor.from_pretrained`` and
-    ``DotsOcrProcessor.from_pretrained`` call ``AutoImageProcessor.from_pretrained``
-    directly, so they raise on oMLX's torch-free env.
-    ``install_auto_processor_patch`` then silently swallows the ``ImportError``
-    and falls back to a ``TokenizersBackend`` with no ``image_processor`` —
-    image content is dropped at ``prepare_inputs()``. See #1131, #1175.
-
-    transformers ships torch-free PIL-backend variants of these image
-    processors (e.g. ``Glm46VImageProcessorPil``, ``Qwen2VLImageProcessorPil``).
-    This patch wraps the affected mlx-vlm processors' ``from_pretrained`` so
-    they substitute the PIL class when ``AutoImageProcessor`` raises.
-    """
-    global _torch_free_ip_patched
-    if _torch_free_ip_patched:
-        return
-
-    try:
-        import transformers
-    except ImportError:
-        return
-
-    if not getattr(transformers.AutoImageProcessor, "is_dummy", False):
-        # torch+torchvision available, AutoImageProcessor works as-is.
-        _torch_free_ip_patched = True
-        return
-
-    for module_path, cls_name in (
-        ("mlx_vlm.models.glm_ocr.processing", "GlmOcrProcessor"),
-        ("mlx_vlm.models.dots_ocr.processing_dots_ocr", "DotsVLProcessor"),
-    ):
-        try:
-            mod = importlib.import_module(module_path)
-            cls = getattr(mod, cls_name)
-            _wrap_from_pretrained_with_pil_image_processor(cls)
-            logger.debug("Wrapped %s.from_pretrained with PIL fallback", cls_name)
-        except (ImportError, AttributeError) as exc:
-            logger.debug(
-                "Skipped torch-free image processor patch for %s: %s",
-                cls_name,
-                exc,
-            )
-
-    _torch_free_ip_patched = True
-
-
-def _wrap_from_pretrained_with_pil_image_processor(cls):
-    """Wrap a ProcessorMixin subclass's ``from_pretrained`` so an ``ImportError``
-    from ``AutoImageProcessor`` triggers PIL fallback instantiation."""
-    if getattr(cls.from_pretrained, "_omlx_torch_free_patched", False):
-        return
-
-    orig = cls.from_pretrained
-
-    @classmethod
-    def patched(cls_inner, path, **kwargs):
-        try:
-            return orig(path, **kwargs)
-        except ImportError as exc:
-            msg = str(exc)
-            if "Torchvision" not in msg and "PyTorch" not in msg:
-                raise
-            logger.info(
-                "AutoImageProcessor unavailable (torch-free env); routing %s "
-                "to PIL image processor",
-                cls_inner.__name__,
-            )
-            return _build_processor_via_pil_image_processor(cls_inner, path, **kwargs)
-
-    patched.__func__._omlx_torch_free_patched = True
-    cls.from_pretrained = patched
-
-
-def _build_processor_via_pil_image_processor(cls, path, **kwargs):
-    """Construct a ProcessorMixin instance using transformers' PIL-backend
-    image processor (looked up via ``IMAGE_PROCESSOR_MAPPING_NAMES``) instead
-    of the torch-gated ``AutoImageProcessor``."""
-    from transformers import AutoTokenizer
-    from transformers.models.auto.auto_mappings import IMAGE_PROCESSOR_MAPPING_NAMES
-
-    trust = kwargs.pop("trust_remote_code", True)
-
-    # Look up image_processor_type from processor_config.json (preferred,
-    # nested under "image_processor") or preprocessor_config.json (legacy).
-    p = Path(path)
-    ip_type = None
-    for fname in ("processor_config.json", "preprocessor_config.json"):
-        cfg_path = p / fname
-        if not cfg_path.exists():
-            continue
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        ip_type = cfg.get("image_processor", {}).get("image_processor_type") or cfg.get(
-            "image_processor_type"
-        )
-        if ip_type:
-            break
-
-    if not ip_type:
-        raise ImportError(
-            f"Cannot determine image_processor_type for {path}; install "
-            "torch+torchvision or upgrade mlx-vlm."
-        )
-
-    # Read feature_extractor config if present (needed for audio models like gemma4_unified)
-    fe_config = {}
-    fe_type = None
-    for fname in ("processor_config.json", "preprocessor_config.json"):
-        cfg_path = p / fname
-        if not cfg_path.exists():
-            continue
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        fe_section = cfg.get("feature_extractor", {})
-        if isinstance(fe_section, dict):
-            fe_config = dict(fe_section)
-            fe_type = fe_config.pop("feature_extractor_type", None)
-            if fe_type:
-                break
-
-    feature_extractor = None
-    if fe_type:
-        # Dynamically import the feature extractor class
-        fe_cls = _resolve_feature_extractor_class(fe_type)
-        if fe_cls is not None:
-            try:
-                feature_extractor = fe_cls(**fe_config)
-                logger.debug("Created feature_extractor %s from %s", fe_type, path)
-            except Exception as e:
-                logger.warning("Failed to create feature_extractor %s: %s", fe_type, e)
-    pil_cls = _resolve_pil_image_processor_class(ip_type, IMAGE_PROCESSOR_MAPPING_NAMES)
-    if pil_cls is None:
-        raise ImportError(
-            f"No torch-free PIL image processor for image_processor_type={ip_type}."
-        )
-
-    image_processor = pil_cls.from_pretrained(str(path), trust_remote_code=trust)
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(path), trust_remote_code=trust, **kwargs
-    )
-
-    # mlx-vlm helper: load chat_template.jinja into tokenizer if present.
-    try:
-        from mlx_vlm.models.base import load_chat_template
-
-        load_chat_template(tokenizer, str(path))
-    except (ImportError, AttributeError):
-        pass
-
-    processor_kwargs = {"image_processor": image_processor, "tokenizer": tokenizer}
-    if feature_extractor is not None:
-        processor_kwargs["feature_extractor"] = feature_extractor
-
-    return cls(**processor_kwargs)
-
-
-def _resolve_pil_image_processor_class(ip_type, mapping_names):
-    """Find a non-dummy PIL backend class matching ``ip_type`` via
-    ``IMAGE_PROCESSOR_MAPPING_NAMES``."""
-    for model_type, mapping in mapping_names.items():
-        if mapping.get("torchvision") != ip_type and mapping.get("pil") != ip_type:
-            continue
-        pil_name = mapping.get("pil")
-        if not pil_name:
-            continue
-        module_name = (
-            f"transformers.models.{model_type}.image_processing_pil_{model_type}"
-        )
-        try:
-            mod = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        candidate = getattr(mod, pil_name, None)
-        if candidate is not None and not getattr(candidate, "is_dummy", False):
-            return candidate
-    return None
-
-
-# Mapping from feature_extractor_type to (module, class) locations in mlx_vlm
-_FEATURE_EXTRACTOR_MAP = {
-    "Gemma4UnifiedAudioFeatureExtractor": (
-        "mlx_vlm.models.gemma4_unified.processing_gemma4_unified",
-        "Gemma4UnifiedAudioFeatureExtractor",
-    ),
-    "Gemma4AudioFeatureExtractor": (
-        "mlx_vlm.models.gemma4.audio_feature_extractor",
-        "Gemma4AudioFeatureExtractor",
-    ),
-}
-
-
-def _resolve_feature_extractor_class(fe_type: str):
-    """Resolve a feature extractor class by its ``feature_extractor_type`` string.
-
-    Returns the class object, or None if not found.
-    """
-    import importlib
-
-    if fe_type in _FEATURE_EXTRACTOR_MAP:
-        mod_name, cls_name = _FEATURE_EXTRACTOR_MAP[fe_type]
-        try:
-            mod = importlib.import_module(mod_name)
-            return getattr(mod, cls_name, None)
-        except ImportError:
-            return None
-
-    return None
 
 
 def _fix_processor_none_pixels(processor):
@@ -1900,6 +1694,8 @@ class VLMBatchedEngine(BaseEngine):
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
         self._diffusion_cancel_events: set[threading.Event] = set()
+        # LFM3 speech requests run outside the scheduler's output collectors.
+        self._speech_active = 0
 
     async def _preflight_or_raise_with_eviction(
         self,
@@ -1929,6 +1725,10 @@ class VLMBatchedEngine(BaseEngine):
         return self._tokenizer
 
     @property
+    def supports_logprobs(self) -> bool:
+        return not self.is_diffusion_model
+
+    @property
     def supports_early_tool_call_streaming(self) -> bool:
         """Opt in only when the local scheduler has no structured parser."""
 
@@ -1951,6 +1751,13 @@ class VLMBatchedEngine(BaseEngine):
             if hasattr(config, "model_type"):
                 return config.model_type
         return None
+
+    @property
+    def speech(self) -> LFM3Speech | None:
+        """ASR, TTS and spoken replies of a loaded LFM3-Audio or LFM3-Omni model."""
+        if self.model_type not in SPEECH_MODEL_TYPES:
+            return None
+        return LFM3Speech(self)
 
     @property
     def message_extractor(self):
@@ -2110,7 +1917,6 @@ class VLMBatchedEngine(BaseEngine):
 
         def _load_vlm_sync():
             _patch_video_processor_bug()
-            _patch_torch_free_image_processor()
             apply_pixtral_torch_free_patch()
             apply_gemma4_audio_patch()
             with (
@@ -2179,6 +1985,19 @@ class VLMBatchedEngine(BaseEngine):
                                 "deepseek_v41_ced_prefill_enabled",
                                 False,
                             )
+                        ),
+                        a8_prefill=bool(
+                            getattr(self._model_settings, "a8_prefill_enabled", False)
+                        ),
+                        a8_prefill_min_tokens=int(
+                            getattr(self._model_settings, "a8_prefill_min_tokens", 128)
+                        ),
+                    )
+                if model_type == "muse_spark":
+                    return muse_spark_model.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
                         ),
                     )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
@@ -2307,10 +2126,20 @@ class VLMBatchedEngine(BaseEngine):
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
-        from ..utils.model_loading import materialize_lazy_state
+        from ..utils.model_loading import (
+            apply_activation_fp16,
+            materialize_lazy_state,
+        )
 
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
+        )
+
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_activation_fp16,
+            self._vlm_model,
+            self._model_settings,
         )
 
         # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
@@ -2523,6 +2352,7 @@ class VLMBatchedEngine(BaseEngine):
                 # Agent sessions resend 20-90 screenshots; bound by bytes.
                 max_memory_entries=4096,
                 max_memory_bytes=1024**3,
+                numerics=numerics_revision_for_model(self._vlm_model),
             )
             logger.info(
                 "Vision feature cache enabled (SSD: %s)",
@@ -2568,16 +2398,6 @@ class VLMBatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
-        if (
-            self._adapter.model_type == "deepseek_v41"
-            and self._adapter.config.ced_prefill
-            and scheduler_config.paged_ssd_cache_dir
-        ):
-            # Approximate decoder states must not become hits in full-prefill
-            # mode (or vice versa) after reloading the model with new settings.
-            scheduler_config.paged_ssd_cache_dir = str(
-                Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
-            )
 
         engine_config = EngineConfig(
             model_name=self._model_name,
@@ -2728,6 +2548,16 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
+        # Flint MoE decode: sigmoid top-k routing and the weighted combine
+        # (plus shared expert and residual) in one launch each per layer.
+        if self.model_type == "flint":
+            try:
+                from ..patches.flint_decode import apply_flint_decode_patch
+
+                apply_flint_decode_patch()
+            except Exception:
+                logger.debug("Flint decode patch not applied", exc_info=True)
+
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch for short rows (decode + MTP verify widths).
         try:
@@ -2753,7 +2583,11 @@ class VLMBatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+        # DeepSeek V4.1 applies the setting in its own loader.
+        if (
+            getattr(self._model_settings, "a8_prefill_enabled", False)
+            and self.model_type != "deepseek_v41"
+        ):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -2763,7 +2597,7 @@ class VLMBatchedEngine(BaseEngine):
                 apply_qwen35_oq_a8_patch(
                     self._vlm_model,
                     min_tokens=int(
-                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                        getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                     ),
                 )
             except Exception:
@@ -2888,7 +2722,14 @@ class VLMBatchedEngine(BaseEngine):
                         get_mlx_executor(), _load_draft
                     )
                     self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model, draft_model_name=specprefill_draft
+                        draft_model,
+                        draft_model_name=specprefill_draft,
+                        keep_pct=getattr(
+                            self._model_settings, "specprefill_keep_pct", None
+                        ),
+                        threshold=getattr(
+                            self._model_settings, "specprefill_threshold", None
+                        ),
                     )
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
@@ -3015,6 +2856,7 @@ class VLMBatchedEngine(BaseEngine):
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
+        self._speech_active = 0
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError
@@ -3036,6 +2878,7 @@ class VLMBatchedEngine(BaseEngine):
         # and examples, so upstream inference incorrectly selects json_tools.
         # Use the same oMLX protocol adapter as distributed ranks.
         from ..adapter.output_parser import (
+            correct_tool_parser_type,
             install_minimax_m3_tokenizer_protocol,
         )
 
@@ -3054,7 +2897,9 @@ class VLMBatchedEngine(BaseEngine):
                 load_tool_module,
             )
 
-            tool_parser_type = _infer_tool_parser(chat_template)
+            tool_parser_type = correct_tool_parser_type(
+                _infer_tool_parser(chat_template), chat_template
+            )
             if tool_parser_type is None:
                 return
             try:
@@ -3065,8 +2910,6 @@ class VLMBatchedEngine(BaseEngine):
         except ImportError:
             # Fallback: mlx_lm only (no Gemma4 support)
             try:
-                import importlib
-
                 from mlx_lm.tokenizer_utils import (
                     _infer_tool_parser as _mlx_lm_infer,
                 )
@@ -3421,9 +3264,48 @@ class VLMBatchedEngine(BaseEngine):
                         video_content.append({"type": "text", "text": item_text})
                 formatted_messages.append({"role": role, "content": video_content})
             else:
+                prompt: Any = content
+                parts: list[dict] = []
+                if isinstance(raw_content, list):
+                    parts = [
+                        (
+                            item
+                            if isinstance(item, dict)
+                            else {
+                                "type": getattr(item, "type", ""),
+                                "text": getattr(item, "text", ""),
+                            }
+                        )
+                        for item in raw_content
+                    ]
+                image_pos = [
+                    i for i, p in enumerate(parts) if p.get("type") in image_part_types
+                ][:msg_num_images]
+                # Text between images labels them, and flattening moves every
+                # image ahead of all text. Audio turns keep the flat layout
+                # because mlx-vlm keeps audio markers in the prefix.
+                if (
+                    msg_num_images > 1
+                    and msg_num_audios == 0
+                    and len(image_pos) == msg_num_images
+                    and extract_text_from_content(
+                        parts[image_pos[0] + 1 : image_pos[-1]]
+                    )
+                ):
+                    prompt = []
+                    for is_image, group in itertools.groupby(
+                        enumerate(parts),
+                        key=lambda ip: ip[1].get("type") in image_part_types,
+                    ):
+                        if is_image:
+                            prompt.extend(
+                                {"type": "image"} for i, _ in group if i in image_pos
+                            )
+                        elif text := extract_text_from_content([p for _, p in group]):
+                            prompt.append({"type": "text", "text": text})
                 formatted = get_message_json(
                     model_type,
-                    content,
+                    prompt,
                     role,
                     skip_image_token=role != "user" or msg_num_images == 0,
                     skip_audio_token=role != "user" or msg_num_audios == 0,
@@ -4090,6 +3972,12 @@ class VLMBatchedEngine(BaseEngine):
         num_videos = len(videos) if videos else 0
 
         model_type = self.model_type or _read_config_model_type(self._model_name) or ""
+        if model_type == "flint" and (num_images or num_audios or num_videos):
+            raise InvalidRequestError(
+                "Flint is a text-only model and does not support "
+                "image, audio, or video input.",
+                field="messages",
+            )
         if model_type == COHERE2_MOE_MODEL_TYPE and (
             num_images > 0 or num_audios > 0
         ):
@@ -4272,6 +4160,10 @@ class VLMBatchedEngine(BaseEngine):
                     "model repository.",
                     field="messages",
                 )
+            # The Unlimited-OCR processor reads a prompt list as a batch with
+            # one image per prompt. A single prompt string keeps every page.
+            if model_type == "unlimited-ocr" and isinstance(prompt, str):
+                prompts = prompt
             # Tokenize text and preprocess images and audio
             inputs = prepare_inputs(
                 self._processor,
@@ -4885,6 +4777,8 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -4915,6 +4809,7 @@ class VLMBatchedEngine(BaseEngine):
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
+            logprobs=output.logprobs,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
         )
@@ -5006,6 +4901,8 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: pass per-request overrides
@@ -5048,6 +4945,7 @@ class VLMBatchedEngine(BaseEngine):
                     finished=output.finished,
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
+                    logprobs=output.logprobs,
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
@@ -5231,11 +5129,11 @@ class VLMBatchedEngine(BaseEngine):
         _, text_messages, images, _, videos = self._extract_request_media(messages)
         if (
             images
-            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self.model_type in {"gemma4", "gemma4_unified", "muse_spark"}
             and self._vlm_model.config.vision_config is None
         ):
             raise InvalidRequestError(
-                "This text-only Gemma 4 model does not support image input.",
+                "This text-only model does not support image input.",
                 field="messages",
             )
         prompt = self._apply_chat_template(
@@ -5414,6 +5312,17 @@ class VLMBatchedEngine(BaseEngine):
         ):
             yield output
 
+    def _is_unlimited_ocr_2(self) -> bool:
+        """True for Unlimited-OCR-2, whose decoder uses DASH sparse attention."""
+        config = getattr(self._vlm_model, "config", None)
+        text_config = getattr(config, "text_config", None)
+        sparse = getattr(text_config, "sparse_attention_config", None)
+        return (
+            self.model_type == "unlimited-ocr"
+            and isinstance(sparse, dict)
+            and sparse.get("training_stage") == "dash"
+        )
+
     def _apply_ocr_prompt(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Apply a default OCR prompt only when the user sends no text.
 
@@ -5433,6 +5342,8 @@ class VLMBatchedEngine(BaseEngine):
             return messages
 
         ocr_prompt = OCR_MODEL_PROMPTS[model_type]
+        if self._is_unlimited_ocr_2():
+            ocr_prompt = UNLIMITED_OCR_2_PROMPT
         messages = copy.deepcopy(messages)
 
         # Find last user message
@@ -6062,6 +5973,8 @@ class VLMBatchedEngine(BaseEngine):
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
+        if getattr(self, "_speech_active", 0):
+            return True
         if self.is_diffusion_model:
             return getattr(self, "_diffusion_active_requests", 0) > 0
         engine_core = getattr(self, "_engine", None)

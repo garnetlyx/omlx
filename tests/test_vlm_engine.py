@@ -139,6 +139,7 @@ class FakeStreamingCore:
             finished=False,
             finish_reason=None,
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
         )
 
@@ -190,6 +191,7 @@ class TestVLMStreamingCleanup:
                     finished=True,
                     finish_reason="length",
                     tool_calls=None,
+                    logprobs=None,
                     cached_tokens=0,
                     generated_at=10.0,
                     generated_until=12.0,
@@ -237,6 +239,7 @@ class TestVLMToolForwarding:
             finished=streaming,
             finish_reason="stop",
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
             first_token_at=None,
         )
@@ -785,6 +788,18 @@ class TestInjectToolCalling:
         assert tokenizer.has_tool_calling is True
         assert tokenizer.tool_call_start == "<tool_call>"
 
+    def test_mimo_template_uses_qwen3_coder(self):
+        """MiMo writes <tool_call><function= with no newline (#4933)."""
+        engine = _make_engine()
+        tokenizer = MockVLMTokenizer(
+            chat_template="'<tool_call><function=' ~ tool_call.name ~ '>'",
+            vocab={"<tool_call>": 100, "</tool_call>": 101},
+        )
+
+        engine._inject_tool_calling(tokenizer)
+
+        assert tokenizer.tool_parser.__module__ == "mlx_vlm.tools.parsers.qwen3_coder"
+
     def test_skips_when_no_chat_template(self):
         """No chat template → no injection."""
         engine = _make_engine()
@@ -966,6 +981,24 @@ class TestApplyChatTemplate:
         assert "enable_thinking" not in call_kwargs
         assert call_kwargs["thinking_mode"] == "enabled"
 
+    @pytest.mark.parametrize(
+        ("effort", "thinking_mode"),
+        [("max", None), ("none", "disabled")],
+    )
+    def test_minimax_m3_forwards_reasoning_effort(self, effort, thinking_mode):
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<prompt>"
+        engine = _make_loaded_engine(model_type="minimax_m3_vl", tokenizer=tokenizer)
+
+        engine._apply_chat_template(
+            [{"role": "user", "content": "Hello"}],
+            chat_template_kwargs={"reasoning_effort": effort},
+        )
+
+        call_kwargs = tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["reasoning_effort"] == effort
+        assert call_kwargs.get("thinking_mode") == thinking_mode
+
     def test_fallback_when_no_template(self):
         """Tokenizer without apply_chat_template → manual concatenation."""
         tokenizer = MagicMock(spec=[])  # spec=[] prevents auto-creating attributes
@@ -1127,6 +1160,27 @@ class TestApplyOcrPrompt:
             if isinstance(p, dict) and p.get("type") == "text"
         ]
         assert text_parts[0]["text"] == "Text Recognition:"
+
+    @pytest.mark.parametrize(
+        "sparse, expected",
+        [
+            (None, "document parsing."),
+            ({"training_stage": "dash"}, "Multi page parsing."),
+        ],
+    )
+    def test_unlimited_ocr_default_prompt_by_version(self, sparse, expected):
+        """Unlimited-OCR-2 (DASH) uses its multi-page default prompt."""
+        engine = _make_loaded_engine(model_type="unlimited-ocr")
+        engine._vlm_model.config.text_config.sparse_attention_config = sparse
+
+        result = engine._apply_ocr_prompt(self._make_image_messages(""))
+
+        text_parts = [
+            p
+            for p in result[0]["content"]
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        assert text_parts[0]["text"] == expected
 
     def test_injects_default_prompt_when_whitespace_only(self):
         """OCR model + whitespace-only text + image → default OCR prompt injected."""
@@ -1518,6 +1572,33 @@ class TestPrepareVisionInputs:
         proc_call = engine._processor.apply_chat_template
         call_kwargs = proc_call.call_args[1]
         assert "tools" not in call_kwargs
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @pytest.mark.parametrize(
+        "model_type, prompt_type", [("unlimited-ocr", str), ("qwen3_vl", list)]
+    )
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_unlimited_ocr_pages_share_one_prompt(
+        self, mock_vlm_act, mock_prepare, model_type, prompt_type
+    ):
+        """A prompt list makes the Unlimited-OCR processor keep only page one."""
+        engine = self._setup_engine_for_vision(model_type=model_type)
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        from PIL import Image
+
+        pages = [Image.new("RGB", (4, 4), c) for c in ("red", "green", "blue")]
+        engine._prepare_vision_inputs(
+            [{"role": "user", "content": "Multi page parsing."}], pages
+        )
+
+        call_kwargs = mock_prepare.call_args[1]
+        assert isinstance(call_kwargs["prompts"], prompt_type)
+        assert call_kwargs["images"] == pages
 
     def test_single_image_model_rejects_multi(self):
         """SINGLE_IMAGE_ONLY_MODELS raise ValueError for multiple images."""
@@ -2036,6 +2117,50 @@ class TestFormatMessagesForVLMTemplate:
 
         assert self._count_image_placeholders(formatted) == 1
         assert image_ranges == [(0, 1)]
+
+    def test_keeps_interleaved_text_and_images_in_order(self):
+        """Each image stays next to the text the user put around it (#4767)."""
+        engine = _make_loaded_engine(model_type="qwen4_exp")
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,a"}}
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Image A:"},
+                    image,
+                    SimpleNamespace(type="text", text="Image B:"),
+                    image,
+                    {"type": "text", "text": "Compare A and B."},
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=2
+        )
+
+        assert [part.get("text", part["type"]) for part in formatted[0]["content"]] == [
+            "Image A:",
+            "image",
+            "Image B:",
+            "image",
+            "Compare A and B.",
+        ]
+        assert image_ranges == [(0, 2)]
+
+    def test_text_before_image_keeps_image_first_layout(self):
+        """Text before a single image keeps the image-first layout."""
+        engine = _make_loaded_engine(model_type="phi3_v")
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,a"}}
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Describe."}, image]}
+        ]
+
+        formatted, _ = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted[0]["content"] == "<|image_1|>Describe."
 
     def test_fallback_inserts_first_user_when_no_explicit_parts(self):
         """Legacy path: num_images without explicit image parts still injects once."""
@@ -3212,6 +3337,7 @@ class TestVLMEngineFrequencyPenalty:
             completion_tokens=2,
             finish_reason="stop",
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
             first_token_at=None,
         )
@@ -3288,6 +3414,7 @@ class TestVLMEngineFrequencyPenalty:
                 finished=True,
                 finish_reason="stop",
                 tool_calls=None,
+                logprobs=None,
                 cached_tokens=0,
             )
 
@@ -3395,11 +3522,11 @@ class TestCaptureVLMPositionState:
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
-@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified", "muse_spark"])
 @pytest.mark.parametrize(
     "vision_config, with_image", [(None, True), (None, False), ({}, True)]
 )
-async def test_preflight_gemma4_image_support(model_type, vision_config, with_image):
+async def test_preflight_text_only_image_support(model_type, vision_config, with_image):
     from omlx.exceptions import InvalidRequestError
 
     engine = _make_loaded_engine(model_type=model_type)
@@ -3419,6 +3546,18 @@ async def test_preflight_gemma4_image_support(model_type, vision_config, with_im
     else:
         await engine.preflight_chat(messages)
         engine._preflight_or_raise_with_eviction.assert_awaited_once()
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+@pytest.mark.parametrize("media", ["images", "audio"])
+def test_flint_rejects_media_input(media):
+    engine = _make_loaded_engine(model_type="flint")
+
+    with pytest.raises(InvalidRequestError, match="text-only"):
+        engine._prepare_vision_inputs(
+            [{"role": "user", "content": "hello"}],
+            **{"images": [], media: [object()]},
+        )
 
 
 @pytest.mark.asyncio
