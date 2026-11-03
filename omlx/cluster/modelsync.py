@@ -371,8 +371,13 @@ def _default_hf_download(
     # hf writes per-file bookkeeping into <local_dir>/.cache/huggingface.
     # A completed download does not need it (hf re-hashes the local file
     # against the hub etag when it is gone), and leaving it drops a cache
-    # into the weights tree.
-    shutil.rmtree(Path(local_dir) / ".cache", ignore_errors=True)
+    # into the weights tree. Only hf's own subtree is removed.
+    cache_root = Path(local_dir) / ".cache"
+    shutil.rmtree(cache_root / "huggingface", ignore_errors=True)
+    try:
+        cache_root.rmdir()
+    except OSError:
+        pass
 
 
 def _normalize_peer_url(peer: str) -> str:
