@@ -23,6 +23,7 @@ import hashlib
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -367,6 +368,11 @@ def _default_hf_download(
         allow_patterns=list(allow_patterns),
         local_dir=str(local_dir),
     )
+    # hf writes per-file bookkeeping into <local_dir>/.cache/huggingface.
+    # A completed download does not need it (hf re-hashes the local file
+    # against the hub etag when it is gone), and leaving it drops a cache
+    # into the weights tree.
+    shutil.rmtree(Path(local_dir) / ".cache", ignore_errors=True)
 
 
 def _normalize_peer_url(peer: str) -> str:
